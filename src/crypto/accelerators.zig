@@ -171,3 +171,12 @@ pub inline fn secp256r1_verify(
 ) void {
     impl.secp256r1_verify(msg, sig, pubkey, verified);
 }
+
+/// U256 hardware-verified division: q = a / b, r = a % b.  b must be nonzero.
+/// Returns true if delegated to an accelerated path; false if the caller should
+/// use native  a / b  and  a % b  instead.
+pub inline fn udivrem256(a: u256, b: u256, q: *u256, r: *u256) bool {
+    if (!@hasDecl(impl, "udivrem256")) return false;
+    impl.udivrem256(a, b, q, r);
+    return true;
+}
