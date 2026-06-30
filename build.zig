@@ -92,6 +92,22 @@ fn buildModules(
     });
     accelerators.addImport("accel_impl", accel_impl);
 
+    // u256_impl is a private leaf: native software arithmetic (native_u256.zig) or
+    // the zkvm-standards extern bridge (extern_u256.zig, whose zkvm_u256_* symbols
+    // the host resolves at link; it also exports the zesu_u256_* software fallback).
+    const u256_impl = b.createModule(.{
+        .root_source_file = b.path(if (freestanding) "src/evm/primitives/extern_u256.zig" else "src/evm/primitives/native_u256.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const u256_math = mkmod(b, expose, "u256_math", .{
+        .root_source_file = b.path("src/evm/primitives/u256_math.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    u256_math.addImport("u256_impl", u256_impl);
+
     const precompile_types = mkmod(b, expose, "precompile_types", .{
         .root_source_file = b.path("src/evm/precompile/types.zig"),
         .target = target,
@@ -160,6 +176,7 @@ fn buildModules(
     interpreter.addImport("precompile", precompile);
     interpreter.addImport("zesu_allocator", zesu_allocator);
     interpreter.addImport("accelerators", accelerators);
+    interpreter.addImport("u256_math", u256_math);
 
     const handler = mkmod(b, expose, "handler", .{
         .root_source_file = b.path("src/evm/handler/main.zig"),
