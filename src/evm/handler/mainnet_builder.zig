@@ -873,6 +873,10 @@ fn executeIterative(
             const sub_reservoir = frame.interp.gas.reservoir;
             const sub_state_spent = frame.interp.gas.state_gas_spent;
             const sub_state_refunded = frame.interp.gas.state_gas_refunded;
+            // EIP-8037: state gas that spilled into the child's regular gas. On revert it is
+            // returned to the parent's regular gas (LIFO); on halt it stays burned. The reservoir
+            // contribution therefore excludes it in both cases.
+            const sub_spilled = frame.interp.gas.state_gas_spilled;
             // EIP-8037: on revert, parent's reservoir should be restored to call_reservoir
             // (the value passed to the child). Derived as:
             //   call_reservoir = sub_reservoir + sub_state_spent - sub_state_refunded
@@ -920,9 +924,12 @@ fn executeIterative(
                         r.state_gas_used = 0;
                         r.state_gas_remaining = sub_reservoir;
                     } else {
-                        // Revert/halt: restore parent.reservoir to call_reservoir.
+                        // Revert/halt: restore parent.reservoir to call_reservoir, but the spilled
+                        // portion was drawn from regular gas — on revert it returns to regular gas
+                        // (gas_remaining), on halt it stays burned (already consumed from remaining).
                         r.state_gas_used = 0;
-                        r.state_gas_remaining = sub_call_reservoir;
+                        r.state_gas_remaining = sub_call_reservoir -| sub_spilled;
+                        if (sub_result == .revert) r.gas_remaining += sub_spilled;
                     }
                     call_ops.resumeCall(parent.interp, r, pc.ret_off, pc.ret_size, pc.new_account_state_gas);
                 },
@@ -954,8 +961,10 @@ fn executeIterative(
                     } else {
                         // finalizeCreate set state_gas_remaining = sub_reservoir; adjust to
                         // call_reservoir + new_account_state_gas (the latter wasn't actually
-                        // consumed since no account was created).
-                        r.state_gas_remaining = sub_call_reservoir + pc.new_account_state_gas;
+                        // consumed since no account was created). The spilled portion was drawn
+                        // from regular gas — on revert it returns to regular gas, on halt burned.
+                        r.state_gas_remaining = (sub_call_reservoir + pc.new_account_state_gas) -| sub_spilled;
+                        if (sub_result == .revert) r.gas_remaining += sub_spilled;
                         parent.interp.gas.state_gas_used -|= pc.new_account_state_gas;
                         parent.interp.gas.state_gas_spent -|= pc.new_account_state_gas;
                     }
