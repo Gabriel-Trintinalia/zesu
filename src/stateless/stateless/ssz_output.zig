@@ -186,29 +186,6 @@ fn htByteList32(data: []const u8) [32]u8 {
     return mixInLength(chunk, data.len);
 }
 
-/// ByteList[2^24]: block_access_list.
-/// limit = 2^24 bytes → ceil(2^24/32) = 2^19 chunk limit → depth 19.
-/// TODO: replace with allocator-backed version for large access lists.
-fn htByteList2_24(data: []const u8) [32]u8 {
-    const chunk_limit_depth = 19;
-    if (data.len == 0) return mixInLength(zeroHash(chunk_limit_depth), 0);
-    const nchunks = (data.len + 31) / 32;
-    if (nchunks <= 32) {
-        var leaf_buf: [32][32]u8 = undefined;
-        for (0..nchunks) |i| {
-            leaf_buf[i] = [_]u8{0} ** 32;
-            const start = i * 32;
-            const end = @min(start + 32, data.len);
-            @memcpy(leaf_buf[i][0 .. end - start], data[start..end]);
-        }
-        const root = sparseRoot(leaf_buf[0..nchunks], chunk_limit_depth);
-        return mixInLength(root, data.len);
-    } else {
-        const root = sparseRootFromBytes(data, chunk_limit_depth);
-        return mixInLength(root, data.len);
-    }
-}
-
 /// ByteList[2^30]: one raw transaction.
 /// limit = 2^30 bytes → 2^25 chunk limit → depth 25.
 fn htByteList2_30(tx_bytes: []const u8) [32]u8 {
@@ -354,7 +331,7 @@ fn htExecutionPayload(alloc: std.mem.Allocator, ep: input.ExecutionPayload) !([3
     // f17..f18: Amsterdam+ only. V3 EP (Prague/Osaka) has slot_number == null;
     // leave chunks[17..31] as zero to match Reth's 17-field ExecutionPayloadV3 hash.
     if (ep.slot_number != null) {
-        chunks[17] = htByteList2_24(ep.block_access_list);
+        chunks[17] = htByteList2_30(ep.block_access_list);
         chunks[18] = htU64(ep.slot_number.?);
     }
 
@@ -544,8 +521,10 @@ const SSZ_CHAIN_CONFIG_AMSTERDAM_MAINNET: [72]u8 = .{
     0x00, 0x00, 0x00, 0x00,
     // chain_config: offset to active_fork (= 12)
     0x0c, 0x00, 0x00, 0x00,
-    // active_fork.fork = 24 (uint64 LE) — ProtocolFork enum index for Amsterdam
-    0x18, 0x00, 0x00, 0x00,
+    // active_fork.fork = 20 (uint64 LE) — ProtocolFork enum index for Amsterdam.
+    // zkevm@v0.5.0 pruned non-scheduled ProtocolFork variants, shifting Amsterdam
+    // from index 24 (v0.4.1) down to 20.
+    0x14, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00,
     // active_fork: offset to activation (= 16)
     0x10, 0x00, 0x00, 0x00,
