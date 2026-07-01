@@ -336,12 +336,16 @@ pub const MainnetHandler = struct {
                         const status: main.ExecutionStatus = if (r.is_revert) .Revert else .Halt;
                         var exec_result = main.ExecutionResult.new(status, exec_gas - r.gas_remaining);
                         exec_result.return_data = alloc_mod.get().dupe(u8, r.return_data) catch @constCast(&[_]u8{});
-                        // EIP-8037 (Amsterdam, bal-devnet-7): top-level CREATE tx halt/revert refunds
-                        // the intrinsic NEW_ACCOUNT*CPSB state gas to the reservoir. setupCreate
-                        // failures (collision/balance/nonce) burn regular gas but not state gas.
+                        // EIP-8037 (Amsterdam): a setupCreate failure (collision/balance/nonce)
+                        // burns the regular create gas but never touches the state-gas reservoir,
+                        // and the intrinsic NEW_ACCOUNT*CPSB is refilled (reference generic_create
+                        // collision path: state_gas_left += reservoir; credit_state_gas_refund).
+                        // Return the full untouched reservoir plus the intrinsic new-account gas —
+                        // for a tx whose gas_limit exceeds TX_MAX_GAS_LIMIT, tx_reservoir holds the
+                        // large excess that must not be charged to the sender.
                         var fr = main.FrameResult.new(exec_result, r.gas_remaining, r.gas_refunded);
                         if (primitives.isEnabledIn(spec, .amsterdam)) {
-                            fr.reservoir_remaining = initial.initial_state_gas;
+                            fr.reservoir_remaining = tx_reservoir + initial.initial_state_gas;
                         }
                         return fr;
                     },
