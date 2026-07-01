@@ -1198,7 +1198,13 @@ pub const JournalInner = struct {
                 acct_is_cold = should_be_cold;
                 _ = existing.markWarmWithTransactionId(self.transaction_id);
                 if (existing.isSelfdestructedLocally()) {
+                    // EIP-8246 (Amsterdam+): SELFDESTRUCT no longer burns. A selfdestructed
+                    // account that retains a non-zero balance is NOT deleted, so re-accessing
+                    // it must preserve that balance (only code/storage/nonce are wiped).
+                    // Pre-8246: the account is reborn empty (balance burned).
+                    const preserved_balance: primitives.U256 = if (primitives.isEnabledIn(self.spec, .amsterdam)) existing.info.balance else 0;
                     existing.selfdestruct();
+                    existing.info.balance = preserved_balance;
                     existing.unmarkSelfdestructedLocally();
                     // Clear the global self_destructed flag: when a new tx accesses a
                     // previously-selfdestructed account, it is reborn as an empty account.
