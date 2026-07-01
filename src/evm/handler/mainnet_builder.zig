@@ -556,19 +556,23 @@ pub const MainnetHandler = struct {
                     .revert => .Revert,
                     else => .Halt,
                 };
-                // EIP-8037 (Amsterdam, bal-devnet-7): on top-level non-success (halt or revert),
-                // refund the full state_gas_used (including any portion that spilled into gas_left)
-                // back to the reservoir — the journal was rolled back, so no state was grown.
+                // EIP-8037 (Amsterdam): on top-level non-success (halt or revert), the journal
+                // was rolled back so no state grew — return the non-spilled state gas to the
+                // reservoir. The spilled portion was drawn from regular gas: on revert it returns
+                // to regular gas (→ sender), on halt it stays burned (reference
+                // refill_frame_state_gas then gas_left is burned on halt, kept on revert).
                 var top_state_gas_used = ir.state_gas_used;
                 var top_reservoir = ir.reservoir_remaining;
+                var top_gas_remaining = ir.gas_remaining;
                 if (primitives.isEnabledIn(spec, .amsterdam) and status != .Success) {
-                    top_reservoir += top_state_gas_used;
+                    top_reservoir += top_state_gas_used -| ir.state_gas_spilled;
+                    if (status == .Revert) top_gas_remaining += ir.state_gas_spilled;
                     top_state_gas_used = 0;
                 }
                 var exec_result = main.ExecutionResult.new(status, 0);
                 exec_result.state_gas_used = top_state_gas_used;
                 exec_result.return_data = alloc_mod.get().dupe(u8, ir.return_data) catch @constCast(&[_]u8{});
-                var fr = main.FrameResult.new(exec_result, ir.gas_remaining, ir.gas_refunded);
+                var fr = main.FrameResult.new(exec_result, top_gas_remaining, ir.gas_refunded);
                 fr.reservoir_remaining = top_reservoir;
                 return fr;
             },
@@ -731,6 +735,8 @@ const IterativeResult = struct {
     state_gas_used: u64,
     /// EIP-8037 (Amsterdam+): state gas reservoir remaining in the root frame after execution.
     reservoir_remaining: u64,
+    /// EIP-8037 (Amsterdam+): state gas that spilled into the root frame's regular gas.
+    state_gas_spilled: u64 = 0,
 };
 
 /// One entry on the iterative call stack.
@@ -842,6 +848,7 @@ fn executeIterative(
                 const gas_ref = frame.interp.gas.refunded;
                 const root_state_gas = frame.interp.gas.state_gas_used;
                 const root_reservoir = frame.interp.gas.reservoir;
+                const root_state_gas_spilled = frame.interp.gas.state_gas_spilled;
                 const rd_raw: []const u8 = if (raw.isSuccess() or raw == .revert)
                     frame.interp.return_data.data
                 else
@@ -862,6 +869,7 @@ fn executeIterative(
                     .return_data = return_data_buf.items,
                     .state_gas_used = root_state_gas,
                     .reservoir_remaining = root_reservoir,
+                    .state_gas_spilled = root_state_gas_spilled,
                 };
             }
 
