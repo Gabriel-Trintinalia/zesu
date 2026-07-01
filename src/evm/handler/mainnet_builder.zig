@@ -381,11 +381,14 @@ pub const MainnetHandler = struct {
                         exec_result.return_data = alloc_mod.get().dupe(u8, cr.return_data) catch @constCast(&[_]u8{});
                         var fr = main.FrameResult.new(exec_result, cr.gas_remaining, cr.gas_refunded);
                         fr.reservoir_remaining = cr.state_gas_remaining;
-                        // EIP-8037 (Amsterdam, bal-devnet-7): on top-level CREATE-tx exceptional
-                        // halt or revert, refund the spilled state_gas_used plus the intrinsic
-                        // NEW_ACCOUNT*CPSB charge — the account was never created.
+                        // EIP-8037 (Amsterdam): on top-level CREATE-tx halt/revert the account
+                        // was never created, so return the non-spilled initcode state gas plus
+                        // the intrinsic NEW_ACCOUNT*CPSB to the reservoir. The spilled portion was
+                        // drawn from regular gas — on revert it returns to regular gas, on halt it
+                        // stays burned (reference refill_frame_state_gas, gas_left burned on halt).
                         if (primitives.isEnabledIn(spec, .amsterdam) and !cr.success) {
-                            fr.reservoir_remaining += ir.state_gas_used + initial.initial_state_gas;
+                            fr.reservoir_remaining += (ir.state_gas_used -| ir.state_gas_spilled) + initial.initial_state_gas;
+                            if (cr_status == .Revert) fr.gas_remaining += ir.state_gas_spilled;
                             fr.result.state_gas_used = 0;
                         }
                         return fr;
