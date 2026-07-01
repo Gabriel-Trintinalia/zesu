@@ -349,6 +349,19 @@ fn callImpl(
 
 /// Resume a suspended CALL frame after the sub-frame has completed.
 /// Called by the frame runner (or synchronous helper) with the final CallResult.
+/// EIP-8037 credit_state_gas_refund for a NEW_ACCOUNT pre-charge that was not consumed
+/// (failed value-CALL / CREATE): refund in LIFO order — to regular gas first if the charge
+/// spilled out of the reservoir, else the reservoir — and unwind it from the frame's totals.
+pub fn refundNewAccountLifo(interp: *Interpreter, amount: u64) void {
+    if (amount == 0) return;
+    const from_gas_left = @min(amount, interp.gas.state_gas_spilled);
+    interp.gas.remaining += from_gas_left;
+    interp.gas.state_gas_spilled -= from_gas_left;
+    interp.gas.reservoir += amount - from_gas_left;
+    interp.gas.state_gas_used -|= amount;
+    interp.gas.state_gas_spent -|= amount;
+}
+
 pub fn resumeCall(interp: *Interpreter, result: host_module.CallResult, ret_off: usize, ret_size: usize, new_account_state_gas: u64) void {
     interp.gas.remaining +|= result.gas_remaining;
     interp.gas.refunded += result.gas_refunded;
@@ -361,14 +374,7 @@ pub fn resumeCall(interp: *Interpreter, result: host_module.CallResult, ret_off:
     // in LIFO order — to regular gas first if that charge had spilled, else the reservoir.
     // Routing to regular gas matters: if this frame later halts, that gas is burned (whereas
     // reservoir gas is returned), matching the reference.
-    if (!result.success and new_account_state_gas > 0) {
-        const from_gas_left = @min(new_account_state_gas, interp.gas.state_gas_spilled);
-        interp.gas.remaining += from_gas_left;
-        interp.gas.state_gas_spilled -= from_gas_left;
-        interp.gas.reservoir += new_account_state_gas - from_gas_left;
-        interp.gas.state_gas_used -|= new_account_state_gas;
-        interp.gas.state_gas_spent -|= new_account_state_gas;
-    }
+    if (!result.success) refundNewAccountLifo(interp, new_account_state_gas);
 
     const actual = @min(result.return_data.len, ret_size);
     if (actual > 0) {
@@ -559,13 +565,12 @@ pub fn opCreate(ctx: *InstructionContext) void {
     const setup = h.setupCreate(caller, value, init_code, forwarded, false, 0, false, ctx.interpreter.input.depth, true);
     switch (setup) {
         .failed => |r| {
-            // EIP-8037: restore reservoir on pre-exec failure (including new_account_state_gas).
-            // Also unwind new_account_state_gas from state_gas_used / state_gas_spent since the
-            // account was never created.
+            // EIP-8037: pre-exec failure (e.g. address collision) — restore the parent reservoir
+            // and refund new_account_state_gas via credit_state_gas_refund (LIFO): to regular gas
+            // first if the charge spilled, else the reservoir. Unwind it from state-gas totals.
             var result = r;
-            result.state_gas_remaining = create_reservoir + new_account_state_gas;
-            ctx.interpreter.gas.state_gas_used -|= new_account_state_gas;
-            ctx.interpreter.gas.state_gas_spent -|= new_account_state_gas;
+            result.state_gas_remaining = create_reservoir;
+            refundNewAccountLifo(ctx.interpreter, new_account_state_gas);
             resumeCreate(ctx.interpreter, result);
         },
         .ready => |s| {
@@ -720,13 +725,12 @@ pub fn opCreate2(ctx: *InstructionContext) void {
     const setup = h.setupCreate(caller, value, init_code, forwarded, true, salt, false, ctx.interpreter.input.depth, true);
     switch (setup) {
         .failed => |r| {
-            // EIP-8037: restore reservoir on pre-exec failure (including new_account_state_gas).
-            // Also unwind new_account_state_gas from state_gas_used / state_gas_spent since the
-            // account was never created.
+            // EIP-8037: pre-exec failure (e.g. address collision) — restore the parent reservoir
+            // and refund new_account_state_gas via credit_state_gas_refund (LIFO), unwinding it
+            // from state-gas totals.
             var result = r;
-            result.state_gas_remaining = create_reservoir + new_account_state_gas;
-            ctx.interpreter.gas.state_gas_used -|= new_account_state_gas;
-            ctx.interpreter.gas.state_gas_spent -|= new_account_state_gas;
+            result.state_gas_remaining = create_reservoir;
+            refundNewAccountLifo(ctx.interpreter, new_account_state_gas);
             resumeCreate(ctx.interpreter, result);
         },
         .ready => |s| {
