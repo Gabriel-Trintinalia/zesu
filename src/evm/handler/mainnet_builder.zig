@@ -231,6 +231,10 @@ pub const MainnetHandler = struct {
                                     if (is_existing) {
                                         if (primitives.isEnabledIn(spec, .amsterdam)) {
                                             initial_gas.auth_state_refund += interpreter_mod.gas_costs.STATE_BYTES_PER_NEW_ACCOUNT * amsterdam_cpsb;
+                                            // Regular-lane counterpart: the intrinsic charges ACCOUNT_WRITE (8000)
+                                            // per auth assuming a new account; an existing authority creates none,
+                                            // so refund it (bypasses the 1/5 cap, like auth_state_refund).
+                                            initial_gas.auth_regular_refund += interpreter_mod.gas_costs.ACCOUNT_WRITE_COST;
                                         } else {
                                             initial_gas.auth_refund += 12500;
                                         }
@@ -428,13 +432,33 @@ pub const MainnetHandler = struct {
                                     0,
                                 );
                             }
+                            // EIP-2780/8037 (Amsterdam+): a value transfer that creates the
+                            // precompile account charges NEW_ACCOUNT state gas. The main
+                            // interpreter path spends it via spendStateGas (reservoir first,
+                            // spilling into regular gas); the precompile fast-path returns
+                            // early and must replicate that arithmetic here.
+                            var pc_reservoir = tx_reservoir;
+                            var pc_gas_remaining = tx_regular_exec_gas - out.gas_used;
+                            if (top_new_account_state_gas > 0) {
+                                if (top_new_account_state_gas <= pc_reservoir) {
+                                    pc_reservoir -= top_new_account_state_gas;
+                                } else {
+                                    const spill = top_new_account_state_gas - pc_reservoir;
+                                    pc_reservoir = 0;
+                                    if (pc_gas_remaining < spill) {
+                                        ctx.journaled_state.checkpointRevert(call_checkpoint);
+                                        return main.FrameResult.new(main.ExecutionResult.new(.Fail, exec_gas), 0, 0);
+                                    }
+                                    pc_gas_remaining -= spill;
+                                }
+                            }
                             ctx.journaled_state.checkpointCommit();
                             var fr = main.FrameResult.new(
                                 main.ExecutionResult.new(.Success, out.gas_used),
-                                tx_regular_exec_gas - out.gas_used,
+                                pc_gas_remaining,
                                 0,
                             );
-                            fr.reservoir_remaining = tx_reservoir;
+                            fr.reservoir_remaining = pc_reservoir;
                             return fr;
                         },
                         .err => {
@@ -542,6 +566,10 @@ pub const MainnetHandler = struct {
         var total_gas_spent: u64 = undefined;
         if (is_amsterdam) {
             total_gas_spent = tx.gas_limit -| result.gas_remaining -| result.reservoir_remaining;
+            // EIP-8037/7702: refund the regular-lane ACCOUNT_WRITE pre-payment for auths to
+            // existing accounts. Applied as a pre-payment correction (bypasses the 1/5 cap),
+            // mirroring auth_state_refund's treatment in the state lane.
+            total_gas_spent -|= initial_gas.auth_regular_refund;
         } else {
             const exec_gas = tx.gas_limit - initial_gas.initial_gas;
             const gas_spent = exec_gas - result.gas_remaining;

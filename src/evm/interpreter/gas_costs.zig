@@ -62,6 +62,9 @@ pub const GAS_STORAGE_UPDATE: u64 = 5000;
 pub const STORAGE_WRITE_AMSTERDAM: u64 = 10000;
 // EIP-8037 (Amsterdam+): storage-clear refund = (STORAGE_WRITE + COLD_STORAGE_ACCESS) * 4800/5000 = 12480.
 pub const REFUND_STORAGE_CLEAR_AMSTERDAM: i64 = @intCast((STORAGE_WRITE_AMSTERDAM + COLD_STORAGE_ACCESS_AMSTERDAM) * 4800 / 5000);
+// EIP-8037 (Amsterdam+): regular-lane cost to write a new account (CALL_VALUE, CREATE,
+// EIP-7702 delegation). Pairs with STATE_BYTES_PER_NEW_ACCOUNT for the state lane.
+pub const ACCOUNT_WRITE_COST: u64 = 8000;
 // State bytes charged per operation (used with cost_per_state_byte)
 pub const STATE_BYTES_PER_STORAGE_SET: u64 = 64;
 pub const STATE_BYTES_PER_NEW_ACCOUNT: u64 = 120;
