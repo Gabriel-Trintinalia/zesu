@@ -561,6 +561,7 @@ pub fn serialize(
     req: input.NewPayloadRequest,
     chain_id: u64,
     successful_validation: bool,
+    activation_timestamp: u64,
 ) ![105]u8 {
     const root = try newPayloadRequestRoot(alloc, req);
     var out: [105]u8 = undefined;
@@ -571,5 +572,9 @@ pub fn serialize(
     // offset — at out[37..45]. Use the actual chain id rather than the mainnet default so
     // non-mainnet chains (and rejected wrong-chain-id blocks) serialize correctly.
     std.mem.writeInt(u64, out[37..45], chain_id, .little);
+    // active_fork.activation.timestamp (u64 LE) at out[73..81] — the zkevm fixtures activate
+    // Amsterdam by timestamp (block_number list empty), so echo the input's activation
+    // timestamp rather than the mainnet default (used by rejected future-activation blocks).
+    std.mem.writeInt(u64, out[73..81], activation_timestamp, .little);
     return out;
 }

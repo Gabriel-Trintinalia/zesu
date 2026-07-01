@@ -224,12 +224,30 @@ fn runBlock(
         }
     }
 
+    // EIP-8025: validate the input's active fork config against the target payload
+    // (reference validate_chain_config → _is_activation_active): the active fork must be
+    // active for the payload — its activation block/timestamp must not be in the future,
+    // and at least one of them must be set. The fork enum itself is not checked here (every
+    // zkevm fixture carries the same Amsterdam active fork; the reference's ProtocolFork
+    // index differs from ours). A future/absent activation means the block is invalid.
+    const chain_config_invalid = blk_cc: {
+        const cc = si.chain_config;
+        if (cc.activation_block == null and cc.activation_timestamp == null) break :blk_cc true;
+        if (cc.activation_block) |b| {
+            if (ep.block_number < b) break :blk_cc true;
+        }
+        if (cc.activation_timestamp) |t| {
+            if (ep.timestamp < t) break :blk_cc true;
+        }
+        break :blk_cc false;
+    };
+
     // successful_validation mirrors spec: True iff execution succeeds AND
     // post_state_root and receipts_root match the payload. executeStatelessInput
     // now validates the roots itself (StateRootMismatch / ReceiptsRootMismatch),
     // so a successful return is authoritative.
     var exec_err: anyerror = error.Success;
-    const successful_validation = if (tx_root_mismatch) false else blk: {
+    const successful_validation = if (tx_root_mismatch or chain_config_invalid) false else blk: {
         _ = executor.executeStatelessInput(alloc, si, fork_name) catch |err| {
             exec_err = err;
             break :blk false;
@@ -237,7 +255,7 @@ fn runBlock(
         break :blk true;
     };
 
-    const computed = try ssz_output.serialize(alloc, si.new_payload_request, si.chain_config.chain_id, successful_validation);
+    const computed = try ssz_output.serialize(alloc, si.new_payload_request, si.chain_config.chain_id, successful_validation, si.chain_config.activation_timestamp orelse 0);
     if (!std.mem.eql(u8, &computed, &expected)) {
         const got_valid = computed[32] == 0x01;
         const expected_valid = expected[32] == 0x01;
