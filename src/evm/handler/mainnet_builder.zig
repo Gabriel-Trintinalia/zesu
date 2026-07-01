@@ -917,6 +917,9 @@ fn executeIterative(
                         r.state_gas_remaining = sub_reservoir;
                         parent.interp.gas.state_gas_spent += sub_state_spent;
                         parent.interp.gas.state_gas_refunded += sub_state_refunded;
+                        // Propagate the child's spilled state gas so a later parent refund
+                        // returns to regular gas in LIFO order (incorporate_child_on_success).
+                        parent.interp.gas.state_gas_spilled += sub_spilled;
                     } else if (sub_result == .invalid_static) {
                         // invalid_static: opCreate charged state gas before the static check
                         // fires. State gas is forfeited (account was being created in a static
@@ -952,6 +955,7 @@ fn executeIterative(
                         r.state_gas_used += sub_state_gas;
                         parent.interp.gas.state_gas_spent += code_deposit_state_gas + sub_state_spent;
                         parent.interp.gas.state_gas_refunded += sub_state_refunded;
+                        parent.interp.gas.state_gas_spilled += sub_spilled;
                         // EIP-8037: CREATE onto an already-alive (pre-funded) address grows no
                         // new account, so refund the NEW_ACCOUNT state gas charged in opCreate
                         // (reference generic_create: credit_state_gas_refund when target_alive).
