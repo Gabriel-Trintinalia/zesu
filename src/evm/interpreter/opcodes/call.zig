@@ -357,10 +357,15 @@ pub fn resumeCall(interp: *Interpreter, result: host_module.CallResult, ret_off:
     // on failure: all child state gas + reservoir returned as state_gas_remaining).
     interp.gas.reservoir += result.state_gas_remaining;
     // EIP-8037: a value-bearing CALL that creates a new account pre-charges NEW_ACCOUNT
-    // state gas. On failure the account is not created, so refund it to the reservoir
-    // and unwind it from the frame's state-gas totals (credit_state_gas_refund).
+    // state gas. On failure the account is not created, so refund it (credit_state_gas_refund)
+    // in LIFO order — to regular gas first if that charge had spilled, else the reservoir.
+    // Routing to regular gas matters: if this frame later halts, that gas is burned (whereas
+    // reservoir gas is returned), matching the reference.
     if (!result.success and new_account_state_gas > 0) {
-        interp.gas.reservoir += new_account_state_gas;
+        const from_gas_left = @min(new_account_state_gas, interp.gas.state_gas_spilled);
+        interp.gas.remaining += from_gas_left;
+        interp.gas.state_gas_spilled -= from_gas_left;
+        interp.gas.reservoir += new_account_state_gas - from_gas_left;
         interp.gas.state_gas_used -|= new_account_state_gas;
         interp.gas.state_gas_spent -|= new_account_state_gas;
     }

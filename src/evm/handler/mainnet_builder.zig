@@ -978,8 +978,15 @@ fn executeIterative(
                         // call_reservoir + new_account_state_gas (the latter wasn't actually
                         // consumed since no account was created). The spilled portion was drawn
                         // from regular gas — on revert it returns to regular gas, on halt burned.
-                        r.state_gas_remaining = (sub_call_reservoir + pc.new_account_state_gas) -| sub_spilled;
+                        r.state_gas_remaining = sub_call_reservoir -| sub_spilled;
                         if (sub_result == .revert) r.gas_remaining += sub_spilled;
+                        // LIFO-refund the parent's NEW_ACCOUNT pre-charge (credit_state_gas_refund):
+                        // to regular gas first if that charge spilled, else the reservoir. Routing
+                        // to regular gas matters — if the parent frame later halts it is burned.
+                        const na_from_gas_left = @min(pc.new_account_state_gas, parent.interp.gas.state_gas_spilled);
+                        parent.interp.gas.remaining += na_from_gas_left;
+                        parent.interp.gas.state_gas_spilled -= na_from_gas_left;
+                        parent.interp.gas.reservoir += pc.new_account_state_gas - na_from_gas_left;
                         parent.interp.gas.state_gas_used -|= pc.new_account_state_gas;
                         parent.interp.gas.state_gas_spent -|= pc.new_account_state_gas;
                     }
