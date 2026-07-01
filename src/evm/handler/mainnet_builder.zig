@@ -187,6 +187,12 @@ pub const MainnetHandler = struct {
                     }
                 }.f;
                 const is_amsterdam = primitives.isEnabledIn(spec, .amsterdam);
+                // EIP-8037 AUTH_BASE refund needs each authority's PRE-TX delegation status.
+                // Recorded on first encounter (the delegation state then reflects no prior
+                // same-tx auth), so later auths on the same signer can distinguish delegated_now
+                // (current code) from delegated_before_tx (pre-transaction code).
+                var authority_pre_delegated = std.AutoHashMap(primitives.Address, bool).init(alloc_mod.get());
+                defer authority_pre_delegated.deinit();
                 for (auth_list.items) |auth_entry| {
                     switch (auth_entry) {
                         .Right => |recovered| {
@@ -267,14 +273,29 @@ pub const MainnetHandler = struct {
                                             initial_gas.auth_refund += 12500;
                                         }
                                     }
-                                    // EIP-7702 (v7.1.0, Amsterdam+): refund STATE_BYTES_PER_AUTH_BASE * cpsb
-                                    // when no new code storage is allocated for the delegation pointer:
-                                    //   - authority already held a delegation indicator (overwrite, no new slot), OR
-                                    //   - clearing delegation (auth.address == 0x0, no code is set).
+                                    // EIP-7702/8037 (Amsterdam+): AUTH_BASE state-gas refund, matching
+                                    // reference set_delegation. delegated_now = current code holds a
+                                    // delegation (reflects prior same-tx auths); delegated_before_tx =
+                                    // pre-transaction code held one (recorded on first encounter).
+                                    //   clearing (addr == 0): refund AUTH_BASE, +AUTH_BASE more if it was
+                                    //     delegated by a prior same-tx auth but not pre-tx.
+                                    //   setting (addr != 0): refund AUTH_BASE if delegated now OR pre-tx
+                                    //     (no new delegation slot is allocated).
                                     if (primitives.isEnabledIn(spec, .amsterdam)) {
+                                        const delegated_now = authority_had_delegation;
+                                        const gop_pd = authority_pre_delegated.getOrPut(authority_addr) catch null;
+                                        const delegated_before_tx = if (gop_pd) |g| blk: {
+                                            if (!g.found_existing) g.value_ptr.* = delegated_now;
+                                            break :blk g.value_ptr.*;
+                                        } else delegated_now;
+                                        const auth_base = interpreter_mod.gas_costs.STATE_BYTES_PER_AUTH_BASE * amsterdam_cpsb;
                                         const auth_address_is_zero = std.mem.eql(u8, &auth.address, &[_]u8{0} ** 20);
-                                        if (authority_had_delegation or auth_address_is_zero) {
-                                            initial_gas.auth_state_refund += interpreter_mod.gas_costs.STATE_BYTES_PER_AUTH_BASE * amsterdam_cpsb;
+                                        if (auth_address_is_zero) {
+                                            initial_gas.auth_state_refund += auth_base;
+                                            if (delegated_now and !delegated_before_tx)
+                                                initial_gas.auth_state_refund += auth_base;
+                                        } else if (delegated_now or delegated_before_tx) {
+                                            initial_gas.auth_state_refund += auth_base;
                                         }
                                     }
 
