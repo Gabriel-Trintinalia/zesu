@@ -605,10 +605,6 @@ pub const MainnetHandler = struct {
         var total_gas_spent: u64 = undefined;
         if (is_amsterdam) {
             total_gas_spent = tx.gas_limit -| result.gas_remaining -| result.reservoir_remaining;
-            // EIP-8037/7702: refund the regular-lane ACCOUNT_WRITE pre-payment for auths to
-            // existing accounts. Applied as a pre-payment correction (bypasses the 1/5 cap),
-            // mirroring auth_state_refund's treatment in the state lane.
-            total_gas_spent -|= initial_gas.auth_regular_refund;
         } else {
             const exec_gas = tx.gas_limit - initial_gas.initial_gas;
             const gas_spent = exec_gas - result.gas_remaining;
@@ -628,7 +624,12 @@ pub const MainnetHandler = struct {
             initial_gas.auth_state_refund
         else
             0;
-        const raw_refund: u64 = exec_refund + auth_refund;
+        // EIP-7702/8037: the regular-lane ACCOUNT_WRITE refund for auths (to existing accounts
+        // or fully-refunded invalid auths) goes into the capped refund counter (reference
+        // interpreter.py: refund_counter += auth_regular_refund), subject to the 1/5 cap —
+        // applied regardless of execution outcome since auth processing is committed pre-exec.
+        const auth_regular_refund: u64 = if (is_amsterdam) initial_gas.auth_regular_refund else 0;
+        const raw_refund: u64 = exec_refund + auth_refund + auth_regular_refund;
         const quotient: u64 = if (is_london) 5 else 2;
         // EIP-3529 refund cap: min(refund, gas_used / max_refund_quotient) where gas_used is
         // the TOTAL gas consumed (intrinsic + execution), not just execution gas.
