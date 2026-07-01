@@ -174,6 +174,19 @@ pub const MainnetHandler = struct {
                     interpreter_mod.gas_costs.costPerStateByte(ctx.block.gas_limit)
                 else
                     0;
+                // EIP-8037/7702: an invalid authorization applies no delegation, so the intrinsic
+                // per-auth pre-payment (NEW_ACCOUNT + AUTH_BASE state, ACCOUNT_WRITE regular) is
+                // fully refunded (reference set_delegation, validate_authorization → None). Adds a
+                // cap-bypassing refund at every skip path below. Amsterdam+ only.
+                const invalid_auth_state_refund: u64 = (interpreter_mod.gas_costs.STATE_BYTES_PER_NEW_ACCOUNT + interpreter_mod.gas_costs.STATE_BYTES_PER_AUTH_BASE) * amsterdam_cpsb;
+                const refundInvalidAuth = struct {
+                    fn f(ig: *validation.InitialAndFloorGas, is_am: bool, state_ref: u64) void {
+                        if (!is_am) return;
+                        ig.auth_state_refund += state_ref;
+                        ig.auth_regular_refund += interpreter_mod.gas_costs.ACCOUNT_WRITE_COST;
+                    }
+                }.f;
+                const is_amsterdam = primitives.isEnabledIn(spec, .amsterdam);
                 for (auth_list.items) |auth_entry| {
                     switch (auth_entry) {
                         .Right => |recovered| {
@@ -184,17 +197,26 @@ pub const MainnetHandler = struct {
                                     // chain_id 0 means valid for any chain
                                     const chain_id_valid = auth.chain_id == 0 or
                                         auth.chain_id == @as(primitives.U256, ctx.cfg.chain_id);
-                                    if (!chain_id_valid) continue;
+                                    if (!chain_id_valid) {
+                                        refundInvalidAuth(initial_gas, is_amsterdam, invalid_auth_state_refund);
+                                        continue;
+                                    }
 
                                     // Per EIP-7702 (EELS reference): skip without warming the authority
                                     // if auth.nonce == maxInt(u64). Applying the auth would overflow the
                                     // nonce. EELS checks this BEFORE adding the account to accessed_addresses,
                                     // so the account remains cold when execution later accesses it.
-                                    if (auth.nonce == std.math.maxInt(u64)) continue;
+                                    if (auth.nonce == std.math.maxInt(u64)) {
+                                        refundInvalidAuth(initial_gas, is_amsterdam, invalid_auth_state_refund);
+                                        continue;
+                                    }
 
                                     // Load authority account (marks it warm; EIP-7702 spec: always access
                                     // the signer's account even if the authorization is ultimately invalid)
-                                    const load_result = js.loadAccountMutOptionalCode(authority_addr, true, false) catch continue;
+                                    const load_result = js.loadAccountMutOptionalCode(authority_addr, true, false) catch {
+                                        refundInvalidAuth(initial_gas, is_amsterdam, invalid_auth_state_refund);
+                                        continue;
+                                    };
                                     const journaled = load_result.data;
 
                                     // Per EIP-7702: skip if authority has non-empty, non-EIP-7702 code.
@@ -211,12 +233,18 @@ pub const MainnetHandler = struct {
                                                 break :blk orig.len >= 3 and orig[0] == 0xEF and orig[1] == 0x01 and orig[2] == 0x00;
                                             },
                                         };
-                                        if (!is_delegation and !existing_code.isEmpty()) continue;
+                                        if (!is_delegation and !existing_code.isEmpty()) {
+                                            refundInvalidAuth(initial_gas, is_amsterdam, invalid_auth_state_refund);
+                                            continue;
+                                        }
                                         authority_had_delegation = is_delegation;
                                     }
 
                                     // Nonce must match exactly — skip if stale
-                                    if (journaled.account.info.nonce != auth.nonce) continue;
+                                    if (journaled.account.info.nonce != auth.nonce) {
+                                        refundInvalidAuth(initial_gas, is_amsterdam, invalid_auth_state_refund);
+                                        continue;
+                                    }
 
                                     // EIP-7702 refund: the intrinsic cost charges PER_EMPTY_ACCOUNT_COST
                                     // (25,000) for each authorization to cover possible new-account creation.
@@ -258,10 +286,10 @@ pub const MainnetHandler = struct {
                                     const bc = bytecode.Bytecode{ .eip7702 = bytecode.Eip7702Bytecode.new(auth.address) };
                                     js.inner.setCode(authority_addr, bc);
                                 },
-                                .Invalid => {}, // skip invalid (unrecoverable) authorities
+                                .Invalid => refundInvalidAuth(initial_gas, is_amsterdam, invalid_auth_state_refund), // unrecoverable authority
                             }
                         },
-                        .Left => {}, // unrecovered signed authorization — skip
+                        .Left => refundInvalidAuth(initial_gas, is_amsterdam, invalid_auth_state_refund), // unrecovered signed authorization
                     }
                 }
             }
