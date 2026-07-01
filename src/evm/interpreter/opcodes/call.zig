@@ -460,9 +460,10 @@ pub fn opCreate(ctx: *InstructionContext) void {
 
     const spec = ctx.interpreter.runtime_flags.spec_id;
 
-    // Pre-Amsterdam: no state gas, so static check is free and happens before any charges.
-    // Amsterdam+ defers this check until after state gas is charged (see below).
-    if (!primitives.isEnabledIn(spec, .amsterdam) and ctx.interpreter.runtime_flags.is_static) {
+    // Static-context check first, before any gas is charged — the reference create/create2
+    // opcodes raise WriteInStaticContext before init-code cost and the NEW_ACCOUNT state-gas
+    // charge, so a create in a static context is charged nothing (not even state gas).
+    if (ctx.interpreter.runtime_flags.is_static) {
         ctx.interpreter.halt(.invalid_static);
         return;
     }
@@ -526,13 +527,6 @@ pub fn opCreate(ctx: *InstructionContext) void {
             ctx.interpreter.halt(.out_of_gas);
             return;
         }
-    }
-
-    // EIP-8037 (Amsterdam+): static check after state gas is charged so the state gas
-    // spill is tracked and returned to the parent's reservoir on frame failure.
-    if (ctx.interpreter.runtime_flags.is_static) {
-        ctx.interpreter.halt(.invalid_static);
-        return;
     }
 
     // EIP-150 (Tangerine Whistle): forward at most 63/64 of remaining gas.
@@ -614,9 +608,9 @@ pub fn opCreate2(ctx: *InstructionContext) void {
 
     const spec = ctx.interpreter.runtime_flags.spec_id;
 
-    // Pre-Amsterdam: no state gas, so static check is free and happens before any charges.
-    // Amsterdam+ defers this check until after state gas is charged (see below).
-    if (!primitives.isEnabledIn(spec, .amsterdam) and ctx.interpreter.runtime_flags.is_static) {
+    // Static-context check first, before any gas is charged (reference raises
+    // WriteInStaticContext before init-code cost and the NEW_ACCOUNT state-gas charge).
+    if (ctx.interpreter.runtime_flags.is_static) {
         ctx.interpreter.halt(.invalid_static);
         return;
     }
@@ -685,13 +679,6 @@ pub fn opCreate2(ctx: *InstructionContext) void {
             ctx.interpreter.halt(.out_of_gas);
             return;
         }
-    }
-
-    // EIP-8037 (Amsterdam+): static check after state gas is charged so the state gas
-    // spill is tracked and returned to the parent's reservoir on frame failure.
-    if (ctx.interpreter.runtime_flags.is_static) {
-        ctx.interpreter.halt(.invalid_static);
-        return;
     }
 
     // EIP-150 (Tangerine Whistle): forward at most 63/64 of remaining gas.
