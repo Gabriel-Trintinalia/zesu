@@ -562,11 +562,14 @@ pub fn serialize(
     chain_id: u64,
     successful_validation: bool,
 ) ![105]u8 {
-    _ = chain_id;
     const root = try newPayloadRequestRoot(alloc, req);
     var out: [105]u8 = undefined;
     @memcpy(out[0..32], &root);
     out[32] = if (successful_validation) 0x01 else 0x00;
     @memcpy(out[33..105], &SSZ_CHAIN_CONFIG_AMSTERDAM_MAINNET);
+    // The SszChainConfig embeds chain_id (u64 LE) immediately after the 4-byte active_fork
+    // offset — at out[37..45]. Use the actual chain id rather than the mainnet default so
+    // non-mainnet chains (and rejected wrong-chain-id blocks) serialize correctly.
+    std.mem.writeInt(u64, out[37..45], chain_id, .little);
     return out;
 }
