@@ -577,6 +577,7 @@ pub fn opCreate(ctx: *InstructionContext) void {
                 .new_addr = s.new_addr,
                 .checkpoint = s.checkpoint,
                 .new_account_state_gas = new_account_state_gas,
+                .target_alive = s.target_alive,
             } };
         },
     }
@@ -737,6 +738,7 @@ pub fn opCreate2(ctx: *InstructionContext) void {
                 .new_addr = s.new_addr,
                 .checkpoint = s.checkpoint,
                 .new_account_state_gas = new_account_state_gas,
+                .target_alive = s.target_alive,
             } };
         },
     }

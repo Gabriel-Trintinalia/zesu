@@ -913,6 +913,12 @@ fn executeIterative(
                         r.state_gas_used += sub_state_gas;
                         parent.interp.gas.state_gas_spent += code_deposit_state_gas + sub_state_spent;
                         parent.interp.gas.state_gas_refunded += sub_state_refunded;
+                        // EIP-8037: CREATE onto an already-alive (pre-funded) address grows no
+                        // new account, so refund the NEW_ACCOUNT state gas charged in opCreate
+                        // (reference generic_create: credit_state_gas_refund when target_alive).
+                        if (pc.target_alive and pc.new_account_state_gas > 0) {
+                            parent.interp.gas.refundStateGas(pc.new_account_state_gas);
+                        }
                     } else {
                         // finalizeCreate set state_gas_remaining = sub_reservoir; adjust to
                         // call_reservoir + new_account_state_gas (the latter wasn't actually

@@ -476,6 +476,8 @@ pub const Host = struct {
         ready: struct {
             checkpoint: JournalCheckpoint,
             new_addr: primitives.Address,
+            /// EIP-8037 (Amsterdam+): target address was alive (pre-funded) before creation.
+            target_alive: bool = false,
         },
     };
 
@@ -854,6 +856,17 @@ fn setupCreateCore(
 
     _ = js.loadAccount(new_addr) catch return .{ .failed = CreateResult.preExecFailure(gas_limit) };
 
+    // EIP-8037 (Amsterdam+): was the target already alive (pre-funded) before creation?
+    // Captured before createAccountCheckpoint transfers value / bumps nonce. A deployable
+    // target has nonce 0 and no code, so aliveness reduces to a pre-existing balance.
+    const target_alive: bool = if (primitives.isEnabledIn(spec_id, .amsterdam)) blk: {
+        if (js.inner.evm_state.get(new_addr)) |acct| {
+            break :blk acct.info.balance > 0 or acct.info.nonce > 0 or
+                !std.mem.eql(u8, &acct.info.code_hash, &primitives.KECCAK_EMPTY);
+        }
+        break :blk false;
+    } else false;
+
     // Address collision: storage already exists at the target address.
     if (js.inner.evm_state.get(new_addr)) |acct| {
         var slot_it = acct.storage.valueIterator();
@@ -881,7 +894,7 @@ fn setupCreateCore(
         js.emitTransferLog(caller, new_addr, value);
     }
 
-    return .{ .ready = .{ .checkpoint = checkpoint, .new_addr = new_addr } };
+    return .{ .ready = .{ .checkpoint = checkpoint, .new_addr = new_addr, .target_alive = target_alive } };
 }
 
 /// Core logic for finalizeCreate.
