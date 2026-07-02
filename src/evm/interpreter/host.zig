@@ -102,6 +102,11 @@ pub const CreateResult = struct {
     state_gas_used: u64,
     /// EIP-8037 (Amsterdam+): reservoir remaining in the child after execution.
     state_gas_remaining: u64,
+    /// EIP-8037 (Amsterdam+): code-deposit state gas that spilled from the child's
+    /// regular gas (reservoir was insufficient). Recorded so the parent's LIFO refill
+    /// on halt/revert treats it as gas_left-drawn (burned on halt) rather than
+    /// reservoir-drawn — otherwise it would inflate the parent reservoir. Defaults to 0.
+    state_gas_spilled: u64 = 0,
 
     /// Pre-execution failure: no sub-interpreter ran, return all forwarded gas.
     pub fn preExecFailure(gas_limit: u64) CreateResult {
@@ -937,6 +942,7 @@ fn finalizeCreateCore(
     var gas_after_deposit: u64 = undefined;
     var remaining_reservoir = gas_reservoir;
     var code_deposit_state_gas: u64 = 0;
+    var code_deposit_spilled: u64 = 0;
     if (primitives.isEnabledIn(spec_id, .amsterdam)) {
         const code_words = (deployed_raw.len + 31) / 32;
         const regular_deposit = gas_costs.G_KECCAK256WORD * @as(u64, code_words);
@@ -954,6 +960,7 @@ fn finalizeCreateCore(
                 const spill = code_deposit_state_gas - remaining_reservoir;
                 remaining_reservoir = 0;
                 gas_after_regular -= spill;
+                code_deposit_spilled = spill;
             } else {
                 js.checkpointRevert(checkpoint);
                 return .{ .success = false, .is_revert = false, .address = [_]u8{0} ** 20, .gas_remaining = 0, .return_data = &[_]u8{}, .gas_refunded = 0, .state_gas_used = 0, .state_gas_remaining = remaining_reservoir };
@@ -987,7 +994,7 @@ fn finalizeCreateCore(
     }
 
     js.checkpointCommit();
-    return .{ .success = true, .is_revert = false, .address = new_addr, .gas_remaining = gas_after_deposit, .return_data = &[_]u8{}, .gas_refunded = gas_refunded, .state_gas_used = code_deposit_state_gas, .state_gas_remaining = remaining_reservoir };
+    return .{ .success = true, .is_revert = false, .address = new_addr, .gas_remaining = gas_after_deposit, .return_data = &[_]u8{}, .gas_refunded = gas_refunded, .state_gas_used = code_deposit_state_gas, .state_gas_remaining = remaining_reservoir, .state_gas_spilled = code_deposit_spilled };
 }
 
 // ---------------------------------------------------------------------------
