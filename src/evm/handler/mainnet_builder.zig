@@ -402,6 +402,16 @@ pub const MainnetHandler = struct {
                         exec_result.return_data = alloc_mod.get().dupe(u8, cr.return_data) catch @constCast(&[_]u8{});
                         var fr = main.FrameResult.new(exec_result, cr.gas_remaining, cr.gas_refunded);
                         fr.reservoir_remaining = cr.state_gas_remaining;
+                        // EIP-8037 (Amsterdam): a top-level CREATE-tx whose target address was
+                        // already alive before creation (pre-funded / pre-existing) does not add
+                        // a NEW account, so the reference refunds the intrinsic NEW_ACCOUNT state
+                        // gas (fork.py: `tx.to == Bytes0 and created_target_alive`). The intrinsic
+                        // was charged via initial_gas rather than the reservoir, so refund it here
+                        // on success. (The create-failure/halt path below refunds it separately,
+                        // matching the `error is not None` arm of the same condition.)
+                        if (primitives.isEnabledIn(spec, .amsterdam) and cr.success and s.target_alive) {
+                            fr.reservoir_remaining += initial.initial_state_gas;
+                        }
                         // EIP-8037 (Amsterdam): on top-level CREATE-tx halt/revert the account
                         // was never created, so return the non-spilled initcode state gas plus
                         // the intrinsic NEW_ACCOUNT*CPSB to the reservoir. The spilled portion was
