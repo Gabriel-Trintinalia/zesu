@@ -506,7 +506,7 @@ pub fn newPayloadRequestRoot(alloc: std.mem.Allocator, req: input.NewPayloadRequ
 
 // ── Serialize output ──────────────────────────────────────────────────────────
 
-/// bal-devnet-7 / zkevm@v0.4.1: SszChainConfig grew from a single uint64 chain_id
+/// glamsterdam-devnet-6 / zkevm@v0.5.0: SszChainConfig grew from a single uint64 chain_id
 /// to a container { chain_id: uint64, active_fork: SszForkConfig } where
 /// SszForkConfig = { fork, activation, blob_schedule } encodes the mainnet
 /// Amsterdam activation + EIP-7691 blob schedule. All v0.4.1 fixtures target
@@ -548,7 +548,7 @@ const SSZ_CHAIN_CONFIG_AMSTERDAM_MAINNET: [72]u8 = .{
     0x00, 0x00, 0x00, 0x00,
 };
 
-/// Serialize SszStatelessValidationResult (bal-devnet-7 / zkevm@v0.4.1):
+/// Serialize SszStatelessValidationResult (glamsterdam-devnet-6 / zkevm@v0.5.0):
 ///   [0..32]   new_payload_request_root  Bytes32
 ///   [32]      successful_validation     boolean (0x01 = valid, 0x00 = invalid)
 ///   [33..105] chain_config (variable, encoded as SszChainConfig with offset)
