@@ -115,6 +115,53 @@ test "PUSH1: near end of code (zero padding)" {
     try expectEqual(@as(U, 0), interp.stack.popUnsafe());
 }
 
+test "PUSH4: partially truncated immediate (zero-padded on the right)" {
+    // Code ends mid-operand: PUSH4 with only 2 of its 4 immediate bytes present.
+    // Reachable in real bytecode — analyzeLegacy does not pad the code — and it is the
+    // branch the direct-load form of opPushNImpl rewrote, so pin the semantics: the
+    // available bytes are the MOST significant of the n-byte field, tail reads as zero.
+    const opPush4 = makePushFn(4);
+    var interp = Interpreter.defaultExt();
+    defer interp.deinit();
+    const code = [_]u8{ 0x63, 0xAA, 0xBB };
+    interp.bytecode = ExtBytecode.newOwned(bytecode_mod.Bytecode.newLegacy(&code));
+    interp.bytecode.pc = 1;
+    var ctx = InstructionContext{ .interpreter = &interp };
+    opPush4(&ctx);
+    try expectEqual(@as(U, 0xAABB0000), interp.stack.popUnsafe());
+}
+
+test "PUSH32: partially truncated immediate keeps high-byte alignment" {
+    // Widest operand, one byte available: 0xAA must land in the top byte of the 32-byte
+    // field, i.e. 0xAA << 248 — not in the low byte.
+    const opPush32 = makePushFn(32);
+    var interp = Interpreter.defaultExt();
+    defer interp.deinit();
+    const code = [_]u8{ 0x7F, 0xAA };
+    interp.bytecode = ExtBytecode.newOwned(bytecode_mod.Bytecode.newLegacy(&code));
+    interp.bytecode.pc = 1;
+    var ctx = InstructionContext{ .interpreter = &interp };
+    opPush32(&ctx);
+    try expectEqual(@as(U, 0xAA) << 248, interp.stack.popUnsafe());
+}
+
+test "PUSH32: full 32-byte immediate" {
+    // Exercises the widest direct-load path (4 unaligned u64 loads + byteswaps).
+    const opPush32 = makePushFn(32);
+    var interp = Interpreter.defaultExt();
+    defer interp.deinit();
+    var code: [33]u8 = undefined;
+    code[0] = 0x7F;
+    for (1..33) |i| code[i] = @intCast(i);
+    interp.bytecode = ExtBytecode.newOwned(bytecode_mod.Bytecode.newLegacy(&code));
+    interp.bytecode.pc = 1;
+    var ctx = InstructionContext{ .interpreter = &interp };
+    opPush32(&ctx);
+    var expected: U = 0;
+    for (1..33) |i| expected = (expected << 8) | @as(U, @intCast(i));
+    try expectEqual(expected, interp.stack.popUnsafe());
+}
+
 test "PUSH1: stack overflow" {
     const opPush1 = makePushFn(1);
     var interp = Interpreter.defaultExt();
@@ -224,7 +271,7 @@ test "DUPN: valid imm=128 (n=17) duplicates item at depth 17" {
     // Rebuild: depth n=17 means the 17th item from the top (1-indexed).
     // After dupUnsafe(17) the top becomes a copy of item[top-17+1] in dupUnsafe convention.
     // Easier: push target first, then 16 fillers, then call DUPN imm=128.
-    interp.stack = @import("../stack.zig").Stack{};
+    interp.stack.length = 0; // clear; Stack is heap-backed now, so no re-init
     interp.stack.pushUnsafe(@as(U, 0xBEEF)); // will be at depth 17 after 16 more pushes
     var j: usize = 0;
     while (j < 16) : (j += 1) interp.stack.pushUnsafe(@as(U, j + 1));

@@ -33,24 +33,45 @@ pub inline fn opPushNImpl(ctx: *InstructionContext, comptime n: u8) void {
         ctx.interpreter.halt(.stack_overflow);
         return;
     }
-    // Read n immediate bytes directly into the right-aligned position of the 32-byte
-    // buffer, skipping the intermediate [n]u8 copy that readImmediates would allocate.
-    var buf: [32]u8 = .{0} ** 32;
+    const U = primitives.U256;
     const ext = &ctx.interpreter.bytecode;
     const bytes = ext.bytecode.bytecode();
     const pc = ext.pc;
-    if (pc + n <= bytes.len) {
-        @memcpy(buf[32 - n ..], bytes[pc .. pc + n]);
-    } else if (pc < bytes.len) {
-        const available = bytes.len - pc;
-        @memcpy(buf[32 - n .. 32 - n + available], bytes[pc..]);
+
+    // Gated on n by measurement, not taste. The direct big-endian read wins big for wide
+    // operands (PUSH9 -19.7%, PUSH17 -15.9%, PUSH26 -20.1% on the EEST 0010M tier) but
+    // loses for narrow ones (PUSH1 +7.6%), and narrow pushes dominate real bytecode — an
+    // ungated rewrite regressed both mainnet (+0.04%) and the tier (+0.38%). The narrow
+    // loss is ~10 extra non-chip instructions per push inside the inlined dispatch arm;
+    // it is not the readInt lowering, a u256 phi spill, or shift-vs-mask billing (all
+    // three tested and ruled out). So keep the buffer form where it already wins.
+    if (n <= 8) {
+        var buf: [32]u8 = .{0} ** 32;
+        if (pc + n <= bytes.len) {
+            @memcpy(buf[32 - n ..], bytes[pc .. pc + n]);
+        } else if (pc < bytes.len) {
+            @memcpy(buf[32 - n ..][0 .. bytes.len - pc], bytes[pc..]);
+        }
+        stack.pushUnsafe((@as(U, std.mem.readInt(u64, buf[0..8], .big)) << 192) |
+            (@as(U, std.mem.readInt(u64, buf[8..16], .big)) << 128) |
+            (@as(U, std.mem.readInt(u64, buf[16..24], .big)) << 64) |
+            @as(U, std.mem.readInt(u64, buf[24..32], .big)));
+    } else if (pc + n <= bytes.len) {
+        // Wide operand, wholly in bounds: one comptime-sized big-endian read straight off
+        // the bytecode. With unaligned-scalar-mem (build.zig) that is a few loads and
+        // byteswaps, with no zeroed 32-byte buffer and no unaligned @memcpy.
+        const Imm = @Int(.unsigned, @as(u16, n) * 8);
+        stack.pushUnsafe(@as(U, std.mem.readInt(Imm, bytes[pc..][0..n], .big)));
+    } else {
+        // Wide operand, code ends at or mid-operand: missing tail reads as zero, i.e. the
+        // available bytes are the most significant of the n-byte field.
+        var buf: [32]u8 = .{0} ** 32;
+        if (pc < bytes.len) @memcpy(buf[32 - n ..][0 .. bytes.len - pc], bytes[pc..]);
+        stack.pushUnsafe((@as(U, std.mem.readInt(u64, buf[0..8], .big)) << 192) |
+            (@as(U, std.mem.readInt(u64, buf[8..16], .big)) << 128) |
+            (@as(U, std.mem.readInt(u64, buf[16..24], .big)) << 64) |
+            @as(U, std.mem.readInt(u64, buf[24..32], .big)));
     }
-    const U = primitives.U256;
-    const value: U = (@as(U, std.mem.readInt(u64, buf[0..8], .big)) << 192) |
-        (@as(U, std.mem.readInt(u64, buf[8..16], .big)) << 128) |
-        (@as(U, std.mem.readInt(u64, buf[16..24], .big)) << 64) |
-        @as(U, std.mem.readInt(u64, buf[24..32], .big));
-    stack.pushUnsafe(value);
     ctx.interpreter.bytecode.relativeJump(n);
 }
 

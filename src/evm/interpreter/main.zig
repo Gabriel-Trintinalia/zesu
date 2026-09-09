@@ -52,6 +52,11 @@ test {
     _ = @import("opcodes/arithmetic_tests.zig");
     _ = @import("opcodes/host_ops_tests.zig");
     _ = @import("opcodes/environment_tests.zig");
+    // stack_tests/memory_tests were unreachable from any test graph: their sibling
+    // source files import them, but nothing imported those siblings, so `zig build
+    // test` silently skipped them.
+    _ = @import("opcodes/stack_tests.zig");
+    _ = @import("opcodes/memory_tests.zig");
 }
 
 /// Main interpreter module for EVM bytecode execution
