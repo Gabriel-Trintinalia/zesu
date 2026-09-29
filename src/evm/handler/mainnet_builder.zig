@@ -363,11 +363,13 @@ pub const MainnetHandler = struct {
         // EIP-8037 (Amsterdam+): split exec_gas into regular and state reservoir.
         // regular_gas_budget = TX_MAX_GAS_LIMIT - intrinsic (the intrinsic is entirely regular
         // gas post-EIP-2780). Any excess exec_gas above regular_gas_budget goes to the reservoir.
-        const tx_regular_exec_gas: u64 = if (primitives.isEnabledIn(spec, .amsterdam)) blk: {
+        // System calls bypass the split with a fixed grant and reservoir (reference
+        // process_unchecked_system_transaction).
+        const tx_regular_exec_gas: u64 = if (ctx.cfg.system_call_gas) |g| g.execution else if (primitives.isEnabledIn(spec, .amsterdam)) blk: {
             const regular_budget = interpreter_mod.gas_costs.TX_MAX_GAS_LIMIT -| initial_gas;
             break :blk @min(regular_budget, exec_gas);
         } else exec_gas;
-        const tx_reservoir: u64 = if (primitives.isEnabledIn(spec, .amsterdam))
+        const tx_reservoir: u64 = if (ctx.cfg.system_call_gas) |g| g.reservoir else if (primitives.isEnabledIn(spec, .amsterdam))
             exec_gas - tx_regular_exec_gas
         else
             0;
