@@ -38,3 +38,22 @@ pub inline fn copyFixed(comptime N: usize, dst: *[N]u8, src: *const [N]u8) void 
         @memcpy(dst, src);
     }
 }
+
+/// Build an EVM JUMPDEST bitmap with the ZisK `jump_dest` precompile (ZisK 1.3+):
+///
+///   csrs 0x81C, src ; add x0, dst, reg(count)
+///
+/// Bit `i` of the little-endian 64-bit words at `bitmap` is set iff byte `i` of
+/// `code` is a JUMPDEST outside PUSH data. Preconditions, each the caller's: both
+/// pointers 8-byte aligned, `bitmap` holds `count.div_ceil(64)` words (all written),
+/// `count > 0`. Like `copyFixed`, the two instructions must stay in one asm block.
+pub inline fn jumpDest(bitmap: [*]align(8) u8, code: [*]align(8) const u8, count: usize) void {
+    asm volatile (
+        \\csrs 0x81C, %[src]
+        \\add x0, %[dst], %[n]
+        :
+        : [src] "r" (code),
+          [dst] "r" (bitmap),
+          [n] "r" (count),
+        : .{ .memory = true });
+}

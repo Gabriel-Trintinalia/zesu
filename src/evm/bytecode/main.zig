@@ -622,10 +622,21 @@ pub const Bytecode = union(enum) {
 };
 
 /// Legacy analyzed bytecode with jump table
+/// Zero bytes after the code in `LegacyAnalyzedBytecode.exec`: a PUSH32 starting on the
+/// last byte reads 32 immediates past the end, and the byte after them is a STOP.
+pub const EXEC_PAD: usize = 33;
+
+const empty_exec: [EXEC_PAD]u8 align(8) = [_]u8{STOP} ** EXEC_PAD;
+
 pub const LegacyAnalyzedBytecode = struct {
     bytecode: []const u8,
     original_len: usize,
     jump_table: JumpTable,
+    /// The code followed by EXEC_PAD zero bytes, for the interpreter only: it fetches
+    /// opcodes and PUSH immediates without a bounds check, since running off the end
+    /// lands on STOP. Everything that observes code (CODESIZE, CODECOPY, EXTCODE*,
+    /// hashing) reads `bytecode`.
+    exec: []align(8) const u8,
 
     const Self = @This();
 
@@ -634,6 +645,7 @@ pub const LegacyAnalyzedBytecode = struct {
             .bytecode = &[_]u8{STOP},
             .original_len = 0,
             .jump_table = JumpTable.fromBytes(&[_]u8{0}, 1),
+            .exec = &empty_exec,
         };
     }
 
@@ -652,8 +664,9 @@ pub const LegacyAnalyzedBytecode = struct {
         //   - default() / empty input: original_len == 0, data is a static &[_]u8{0}
         //   - alloc-failure fallback: jump_table.data.len == 0, data is static &[_]u8{}
         if (self.original_len > 0 and self.jump_table.data.len > 0) {
-            alloc_mod.get().free(self.jump_table.data);
+            alloc_mod.get().free(@as([]align(8) const u8, @alignCast(self.jump_table.data)));
         }
+        if (self.original_len > 0) alloc_mod.get().free(self.exec);
     }
 };
 
@@ -755,12 +768,27 @@ fn analyzeLegacy(bytecode: []const u8) LegacyAnalyzedBytecode {
             .bytecode = &[_]u8{STOP},
             .original_len = 0,
             .jump_table = JumpTable.fromBytes(&[_]u8{0}, 1),
+            .exec = &empty_exec,
         };
     }
 
-    // Allocate bit vector on heap (one bit per bytecode position) to avoid dangling pointer
-    const bit_vec_len = (bytecode.len + 7) / 8;
-    const bit_vec = alloc_mod.get().alloc(u8, bit_vec_len) catch @panic("out of memory");
+    // Allocate bit vector on heap (one bit per bytecode position) to avoid dangling pointer.
+    // Whole, 8-byte aligned 64-bit words: the ZisK jump_dest precompile writes them in full.
+    const bit_vec = alloc_mod.get().alignedAlloc(u8, .@"8", (bytecode.len + 63) / 64 * 8) catch @panic("out of memory");
+    const exec = alloc_mod.get().alignedAlloc(u8, .@"8", bytecode.len + EXEC_PAD) catch @panic("out of memory");
+    @memcpy(exec[0..bytecode.len], bytecode);
+    @memset(exec[bytecode.len..], STOP);
+
+    if (comptime primitives.dma.has_dma) {
+        // ZisK: one precompile call over the aligned copy (bytecode.len > 0 here).
+        primitives.dma.jumpDest(bit_vec.ptr, exec.ptr, bytecode.len);
+        return LegacyAnalyzedBytecode{
+            .bytecode = bytecode,
+            .original_len = bytecode.len,
+            .jump_table = JumpTable.fromBytes(bit_vec, bytecode.len),
+            .exec = exec,
+        };
+    }
     @memset(bit_vec, 0);
 
     // Analyze bytecode to find JUMPDEST positions.
@@ -793,6 +821,7 @@ fn analyzeLegacy(bytecode: []const u8) LegacyAnalyzedBytecode {
         .bytecode = bytecode,
         .original_len = bytecode.len,
         .jump_table = JumpTable.fromBytes(bit_vec, bytecode.len),
+        .exec = exec,
     };
 }
 
