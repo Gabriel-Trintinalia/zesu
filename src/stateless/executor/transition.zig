@@ -20,7 +20,7 @@ const bloom = @import("bloom.zig");
 /// equality for [20]u8. BaTracker keys almost everything by address and touches these maps on
 /// every state access, so the generic context showed up as a large share of BAL tracking.
 fn AddrMap(comptime V: type) type {
-    return std.HashMapUnmanaged(input.Address, V, primitives.AddressContext, 80);
+    return primitives.AddrMapUnmanaged(V);
 }
 const rlp = @import("./rlp_encode.zig");
 const precompile_mod = @import("precompile");

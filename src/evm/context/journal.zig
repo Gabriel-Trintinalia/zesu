@@ -438,7 +438,7 @@ pub const JournalInner = struct {
     // set, which — unioned with account_writes and storage — determines BAL membership.
     // Crucially it EXCLUDES accounts merely created (never read), so a same-tx
     // create+selfdestruct ephemeral does not appear in the BAL. Block-scoped.
-    bal_account_reads: std.HashMap(primitives.Address, void, primitives.AddressContext, 80),
+    bal_account_reads: primitives.AddrMap(void),
 
     pub fn new() JournalInner {
         return .{
@@ -451,7 +451,7 @@ pub const JournalInner = struct {
             .spec = primitives.SpecId.prague,
             .warm_addresses = WarmAddresses.new(),
             .pending_burns = std.ArrayList(PendingBurn).empty,
-            .bal_account_reads = std.HashMap(primitives.Address, void, primitives.AddressContext, 80).init(alloc_mod.get()),
+            .bal_account_reads = primitives.AddrMap(void).init(alloc_mod.get()),
         };
     }
 

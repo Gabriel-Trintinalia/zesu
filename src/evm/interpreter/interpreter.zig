@@ -755,7 +755,9 @@ fn sar(shift: U, value: U) U {
 inline fn validJump(fr: *const Frame, dest: U) ?usize {
     if (dest >= fr.jlen) return null;
     const d: usize = @intCast(dest);
-    if ((fr.jbits[d >> 3] >> @intCast(d & 7)) & 1 == 0) return null;
+    // Whole aligned words: an `ld` is cheaper in ZisK than a sub-word `lbu`.
+    const words: [*]const u64 = @ptrCast(@alignCast(fr.jbits));
+    if ((words[d >> 6] >> @intCast(d & 63)) & 1 == 0) return null;
     return d;
 }
 

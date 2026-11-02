@@ -57,7 +57,7 @@ pub const WitnessDatabase = struct {
     /// trie walks in storage() and in the post-execution batch update (storageRootFor), and
     /// lets that update skip accounts the block left unchanged (originalAccount). Accounts
     /// absent from pre-state are cached with exists = false and EMPTY_TRIE_HASH.
-    original_accounts: std.HashMap(primitives.Address, OriginalAccount, primitives.AddressContext, 80),
+    original_accounts: primitives.AddrMap(OriginalAccount),
     /// mpt.validateSecuredTriePaths's filter over `node_index` and stack.
     path_check: mpt.PathCheck,
     /// Storage roots whose witness trie has passed checkTriePaths, so each trie the
@@ -127,7 +127,7 @@ pub const WitnessDatabase = struct {
             .witness_codes = witness_codes,
             .block_hashes = block_hashes,
             .deployed_codes = std.HashMap(primitives.Hash, bytecode.Bytecode, primitives.HashContext, 80).init(alloc),
-            .original_accounts = std.HashMap(primitives.Address, OriginalAccount, primitives.AddressContext, 80).init(alloc),
+            .original_accounts = primitives.AddrMap(OriginalAccount).init(alloc),
             .path_check = try mpt.PathCheck.init(alloc, node_index),
             .checked_storage_roots = std.HashMap(primitives.Hash, void, primitives.HashContext, 80).init(alloc),
             .alloc = alloc,

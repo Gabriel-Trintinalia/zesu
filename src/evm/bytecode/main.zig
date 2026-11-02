@@ -628,6 +628,9 @@ pub const EXEC_PAD: usize = 34;
 
 const empty_exec: [EXEC_PAD]u8 align(8) = [_]u8{STOP} ** EXEC_PAD;
 
+/// The jump table of empty code: one whole aligned word, as the interpreter reads them.
+const empty_jump_word: [8]u8 align(8) = .{0} ** 8;
+
 pub const LegacyAnalyzedBytecode = struct {
     bytecode: []const u8,
     original_len: usize,
@@ -644,7 +647,7 @@ pub const LegacyAnalyzedBytecode = struct {
         return Self{
             .bytecode = &[_]u8{STOP},
             .original_len = 0,
-            .jump_table = JumpTable.fromBytes(&[_]u8{0}, 1),
+            .jump_table = JumpTable.fromBytes(&empty_jump_word, 1),
             .exec = &empty_exec,
         };
     }
@@ -767,7 +770,7 @@ fn analyzeLegacy(bytecode: []const u8) LegacyAnalyzedBytecode {
         return LegacyAnalyzedBytecode{
             .bytecode = &[_]u8{STOP},
             .original_len = 0,
-            .jump_table = JumpTable.fromBytes(&[_]u8{0}, 1),
+            .jump_table = JumpTable.fromBytes(&empty_jump_word, 1),
             .exec = &empty_exec,
         };
     }
