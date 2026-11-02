@@ -81,6 +81,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--summary-md") and i + 1 < args.len) {
             i += 1;
             summary_md = args[i];
+        } else if (std.mem.eql(u8, a, "--bins") and i + 1 < args.len) {
+            i += 1;
+            try runBins(init, gpa, args[i]);
+            return;
         } else if (std.mem.eql(u8, a, "--summary-json") and i + 1 < args.len) {
             i += 1;
             summary_json = args[i];
@@ -477,4 +481,26 @@ fn writeSummaries(
         );
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = w.buffered() });
     }
+}
+
+/// TEMPORARY: execute framed guest inputs (u64 LE length + SSZ) and dump executed opcode-pair counts.
+fn runBins(init: std.process.Init, gpa: std.mem.Allocator, path: []const u8) !void {
+    var dir = try std.Io.Dir.cwd().openDir(init.io, path, .{ .iterate = true });
+    defer dir.close(init.io);
+    var it = dir.iterate();
+    var ok: usize = 0;
+    var n: usize = 0;
+    while (try it.next(init.io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".bin")) continue;
+        const raw = try dir.readFileAlloc(init.io, entry.name, gpa, .limited(1 << 30));
+        defer gpa.free(raw);
+        const len = std.mem.readInt(u64, raw[0..8], .little);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        n += 1;
+        const si = ssz_decode.decode(alloc, raw[8..][0..len]) catch continue;
+        if (executor.executeStatelessInput(alloc, si, si.chain_config.fork_name)) |_| ok += 1 else |_| {}
+    }
+    std.debug.print("blocks valid {d}/{d}\n", .{ ok, n });
 }

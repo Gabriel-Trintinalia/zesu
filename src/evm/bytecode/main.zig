@@ -623,8 +623,8 @@ pub const Bytecode = union(enum) {
 
 /// Legacy analyzed bytecode with jump table
 /// Zero bytes after the code in `LegacyAnalyzedBytecode.exec`: a PUSH32 starting on the
-/// last byte reads 32 immediates past the end, and the byte after them is a STOP.
-pub const EXEC_PAD: usize = 33;
+/// last byte reads 32 immediates past the end, then the two-byte dispatch key after them.
+pub const EXEC_PAD: usize = 34;
 
 const empty_exec: [EXEC_PAD]u8 align(8) = [_]u8{STOP} ** EXEC_PAD;
 

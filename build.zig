@@ -820,6 +820,7 @@ pub fn build(b: *std.Build) void {
         r2_exe.root_module.addImport("ssz_decode", mods.ssz_decode);
         r2_exe.root_module.addImport("ssz_output", mods.ssz_output);
         r2_exe.root_module.addImport("executor", mods.executor);
+        r2_exe.root_module.addImport("interpreter", mods.interpreter);
         r2_exe.root_module.addOptions("build_options", r2_options);
         addCryptoLibraries(r2_exe, crypto_backend, crypto_include, libblst_path, libmcl_path, is_linux);
         b.installArtifact(r2_exe);

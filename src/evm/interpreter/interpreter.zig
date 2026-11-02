@@ -541,97 +541,51 @@ pub const Interpreter = struct {
 // against a median of 1,962 with ~80% of it in dispatch rather than the shift.
 // PUSH0 and the rest stay cold.
 
-/// Interpreter state the dispatch loop keeps in registers. `self.gas.remaining`,
-/// `self.stack.length` and `self.bytecode.pc` are STALE while an inlined arm runs:
-/// anything that reads or writes them through `self`/`ctx` (every handler outside
-/// the inlined arms) must be bracketed by `spill` and `reload`.
-///
-/// They were reloaded from memory on every opcode: a pushed word's four limb
-/// stores may alias `stack.length` (Zig has no type-based alias analysis), and the
-/// handlers reach the stack and gas through `ctx`, so LLVM could not keep either
-/// in a register across an arm.
-const Regs = struct {
-    pc: usize,
-    gas: u64,
-    /// Stack length.
-    sp: usize,
+const U = primitives.U256;
+
+/// Per-frame constants the threaded handlers read through one pointer.
+const Frame = struct {
+    self: *Interpreter,
+    /// The zero-padded code the handlers fetch from; `ip - base` is the pc.
+    base: [*]const u8,
     /// Stack base; the backing store is fixed for the frame.
-    sb: [*]primitives.U256,
+    sb: [*]U,
+    /// JUMPDEST bitmap, one bit per code byte; empty for a delegation designator.
+    jbits: [*]const u8,
+    jlen: usize,
+    code_len: usize,
+    /// Block and transaction context; null when running without a host.
+    host: ?*Host,
 };
 
-inline fn spill(self: *Interpreter, r: *const Regs) void {
-    self.bytecode.pc = r.pc;
+/// Interpreter state the handlers pass each other in registers. `self.gas.remaining`,
+/// `self.stack.length` and `self.bytecode.pc` are stale until a handler hands an op
+/// back to runDispatch and `spill`s them.
+const Regs = struct {
+    ip: [*]const u8,
+    gas: u64,
+    /// One past the top of the stack: `sb + sp`.
+    top: [*]U,
+    /// Stack length.
+    sp: usize,
+};
+
+/// One handler per (opcode, next byte): the table is indexed by the two bytes at the
+/// instruction pointer, so a hot pair runs as one handler. Every handler ends in a tail
+/// call to the next one, or returns to runDispatch with an op it does not run itself.
+const Handler = *const fn (fr: *const Frame, ip: [*]const u8, gas: u64, top: [*]U, sp: usize, tbl: *const anyopaque) callconv(.c) void;
+
+inline fn spill(fr: *const Frame, r: *const Regs) void {
+    const self = fr.self;
+    self.bytecode.pc = @intFromPtr(r.ip) - @intFromPtr(fr.base);
     self.gas.remaining = r.gas;
     self.stack.length = r.sp;
 }
 
-inline fn reload(self: *Interpreter, r: *Regs) void {
-    r.pc = self.bytecode.pc;
-    r.gas = self.gas.remaining;
-    r.sp = self.stack.length;
-}
-
-/// Halt from an inlined arm. Errors consume all gas, as `halt` does.
-inline fn fail(self: *Interpreter, r: *Regs, res: InstructionResult) void {
-    if (res.isError()) r.gas = 0;
-    spill(self, r);
-    self.halt(res);
-}
-
-/// Charge static gas; on out-of-gas halt and return false.
-inline fn charge(self: *Interpreter, r: *Regs, cost: u64) bool {
-    if (r.gas < cost) {
-        fail(self, r, .out_of_gas);
-        return false;
-    }
-    r.gas -= cost;
-    return true;
-}
-
-/// Pop two, push f(top, second). Gas before the stack check, as the handlers did.
-inline fn binop(self: *Interpreter, r: *Regs, comptime cost: u64, comptime f: fn (primitives.U256, primitives.U256) primitives.U256) bool {
-    if (!charge(self, r, cost)) return false;
-    if (r.sp < 2) {
-        fail(self, r, .stack_underflow);
-        return false;
-    }
-    const a = r.sb[r.sp - 1];
-    const b = r.sb[r.sp - 2];
-    r.sp -= 1;
-    r.sb[r.sp - 1] = f(a, b);
-    return true;
-}
-
-/// Replace the top with f(top).
-inline fn unop(self: *Interpreter, r: *Regs, comptime cost: u64, comptime f: fn (primitives.U256) primitives.U256) bool {
-    if (!charge(self, r, cost)) return false;
-    if (r.sp < 1) {
-        fail(self, r, .stack_underflow);
-        return false;
-    }
-    r.sb[r.sp - 1] = f(r.sb[r.sp - 1]);
-    return true;
-}
-
-/// Push `v` after charging `cost`.
-inline fn pushReg(self: *Interpreter, r: *Regs, comptime cost: u64, v: primitives.U256) bool {
-    if (!charge(self, r, cost)) return false;
-    if (r.sp >= stack_mod.STACK_LIMIT) {
-        fail(self, r, .stack_overflow);
-        return false;
-    }
-    r.sb[r.sp] = v;
+inline fn push(r: *Regs, v: U) void {
+    r.top[0] = v;
+    r.top += 1;
     r.sp += 1;
-    return true;
-}
-
-/// Run a handler that goes through `self`/`ctx`. Returns false if it halted.
-inline fn viaSelf(self: *Interpreter, r: *Regs, comptime cost: u64, comptime handler: anytype, args: anytype) bool {
-    if (!charge(self, r, cost)) return false;
-    spill(self, r);
-    @call(.always_inline, handler, args);
-    reload(self, r);
-    return self.bytecode.isNotEnd();
 }
 
 const ops = struct {
@@ -712,359 +666,668 @@ fn runDispatch(
     // delegated account runs the target's 0xef01.. bytes, and halts on 0xef); its
     // 23 bytes are padded here, on the stack, for the length of this call.
     var designator: [23 + bytecode.EXEC_PAD]u8 = undefined;
+    var jbits: [*]const u8 = &.{};
+    var jlen: usize = 0;
     const code: []const u8 = switch (self.bytecode.inner) {
-        .legacy_analyzed => |*a| a.exec,
+        .legacy_analyzed => |*a| blk: {
+            jbits = a.jump_table.data.ptr;
+            jlen = a.jump_table.bit_len;
+            break :blk a.exec;
+        },
         .eip7702 => |*d| blk: {
             @memset(&designator, bytecode.STOP);
             @memcpy(designator[0..23], &d.raw_bytes);
             break :blk &designator;
         },
     };
-    const code_len = self.bytecode.bytes().len;
-    // EIP-145. Loop-invariant: spec_id is fixed for the frame.
-    const has_shifts = primitives.isEnabledIn(self.runtime_flags.spec_id, .constantinople);
-    // EIP-3855. Loop-invariant like has_shifts.
-    const has_push0 = primitives.isEnabledIn(self.runtime_flags.spec_id, .shanghai);
-    // EIP-211. Loop-invariant like has_shifts.
-    const has_returndata = primitives.isEnabledIn(self.runtime_flags.spec_id, .byzantium);
-
-    var r = Regs{
-        .pc = self.bytecode.pc,
-        .gas = self.gas.remaining,
-        .sp = self.stack.length,
+    const fr = Frame{
+        .self = self,
+        .base = code.ptr,
         .sb = self.stack.data.ptr,
+        .jbits = jbits,
+        .jlen = jlen,
+        .code_len = self.bytecode.bytes().len,
+        .host = ctx.host,
     };
+    // Osaka and later open every fork gate the fast path knows (EIP-145, EIP-211,
+    // EIP-3855, EIP-7939); earlier forks hand the gated ops to the table below.
+    const t: *const [65536]Handler = if (primitives.isEnabledIn(self.runtime_flags.spec_id, .osaka)) &modern_table else &legacy_table;
+    while (true) {
+        // The handlers run until an op they do not run themselves: a cold or gated op,
+        // a halt, or any check that fails. They leave pc at that op.
+        const ip = code.ptr + self.bytecode.pc;
+        const h = t[key(ip)];
+        // Straight to the table when the chain would hand the op back at once.
+        if (h != &exit) h(&fr, ip, self.gas.remaining, fr.sb + self.stack.length, self.stack.length, @ptrCast(t));
+        // Run that op through the instruction table, as `step` does.
+        const op = code[self.bytecode.pc];
+        self.bytecode.pc += 1;
+        const entry = table[op];
+        if (!self.gas.spend(entry.static_gas)) return self.halt(.out_of_gas);
+        entry.func(ctx);
+        if (!self.bytecode.isNotEnd()) return;
+        // Only the CALL/CREATE family suspends the frame.
+        if (check_pending and self.pending != .none) return;
+    }
+}
 
-    // Inlined arms return on any halt (through `fail`), so they continue without
-    // re-testing `continue_execution`. `pending` is set only by the CALL/CREATE
-    // family, reached through the cold path, which is the one arm that re-checks it.
-    sw: switch (code[r.pc]) {
-        0x00 => { // STOP
-            r.pc += 1;
-            spill(self, &r);
-            opcodes.opStop(ctx);
+/// The two bytes at `ip`, opcode in the low byte.
+inline fn key(ip: [*]const u8) u16 {
+    return std.mem.readInt(u16, ip[0..2], .little);
+}
+
+inline fn next(fr: *const Frame, r: Regs, tbl: *const anyopaque) void {
+    const t: *const [65536]Handler = @ptrCast(@alignCast(tbl));
+    return @call(.always_tail, t[key(r.ip)], .{ fr, r.ip, r.gas, r.top, r.sp, tbl });
+}
+
+/// `body`: done, jumped (the next op is elsewhere), or declined with `r` untouched.
+const Flow = enum { next, jumped, slow };
+
+fn binFn(comptime op: u8) fn (U, U) U {
+    return switch (op) {
+        0x01 => ops.add,
+        0x02 => ops.mul,
+        0x03 => ops.sub,
+        0x10 => ops.lt,
+        0x11 => ops.gt,
+        0x12 => ops.slt,
+        0x13 => ops.sgt,
+        0x14 => ops.eq,
+        0x16 => ops.band,
+        0x17 => ops.bor,
+        0x18 => ops.bxor,
+        0x1A => ops.byte,
+        0x1B => ops.shl,
+        0x1C => ops.shr,
+        0x1D => sar,
+        else => unreachable,
+    };
+}
+
+fn sar(shift: U, value: U) U {
+    const v: i256 = @bitCast(value);
+    if (shift >= 256) return if (v < 0) ~@as(U, 0) else 0;
+    return @bitCast(v >> @intCast(shift));
+}
+
+/// A valid JUMPDEST.
+inline fn validJump(fr: *const Frame, dest: U) ?usize {
+    if (dest >= fr.jlen) return null;
+    const d: usize = @intCast(dest);
+    if ((fr.jbits[d >> 3] >> @intCast(d & 7)) & 1 == 0) return null;
+    return d;
+}
+
+/// Static checks for `op` (skipped when a fused pair checked them together).
+inline fn ok(comptime op: u8, comptime ck: bool, r: *const Regs) bool {
+    if (!ck) return true;
+    const m = comptime model(op).?;
+    if (r.gas < m.gas or r.sp < m.pops) return false;
+    if (m.pushes > m.pops and r.sp > stack_mod.STACK_LIMIT - (m.pushes - m.pops)) return false;
+    return true;
+}
+
+/// The hot path of one opcode: no calls, and nothing that can halt. Anything off the
+/// fast path (out of gas, stack bounds, a bad jump, memory growth) returns `.slow`
+/// before touching `r`, and runDispatch runs the op through the instruction table.
+/// With `ck == false` the caller has checked `model(op)` already.
+inline fn body(comptime op: u8, comptime ck: bool, fr: *const Frame, r: *Regs) Flow {
+    const self = fr.self;
+    const m = comptime model(op).?;
+    if (!ok(op, ck, r)) return .slow;
+    switch (op) {
+        0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C, 0x1D => {
+            const a = (r.top - 1)[0];
+            const b = (r.top - 2)[0];
+            r.top -= 1;
+            r.sp -= 1;
+            (r.top - 1)[0] = binFn(op)(a, b);
         },
-        0x01 => { // ADD
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.add)) return;
-            continue :sw code[r.pc];
-        },
-        0x02 => { // MUL
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_LOW, ops.mul)) return;
-            continue :sw code[r.pc];
-        },
-        0x03 => { // SUB
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.sub)) return;
-            continue :sw code[r.pc];
-        },
-        0x10 => { // LT
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.lt)) return;
-            continue :sw code[r.pc];
-        },
-        0x11 => { // GT
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.gt)) return;
-            continue :sw code[r.pc];
-        },
-        0x12 => { // SLT
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.slt)) return;
-            continue :sw code[r.pc];
-        },
-        0x13 => { // SGT
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.sgt)) return;
-            continue :sw code[r.pc];
-        },
-        0x1A => { // BYTE
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.byte)) return;
-            continue :sw code[r.pc];
-        },
-        0x35 => { // CALLDATALOAD: 32 bytes of calldata at offset, zero-filled past the end
-            r.pc += 1;
-            if (!charge(self, &r, gas_costs.G_VERYLOW)) return;
-            if (r.sp < 1) {
-                fail(self, &r, .stack_underflow);
-                return;
-            }
-            const offset = r.sb[r.sp - 1];
+        0x15 => (r.top - 1)[0] = ops.iszero((r.top - 1)[0]),
+        0x19 => (r.top - 1)[0] = ops.not((r.top - 1)[0]),
+        0x1E => (r.top - 1)[0] = @clz((r.top - 1)[0]), // CLZ (EIP-7939): 256 for zero
+        0x35 => { // CALLDATALOAD: whole word in range, or wholly past the end
+            const offset = (r.top - 1)[0];
             const data = self.input.data;
-            var word: [32]u8 = [_]u8{0} ** 32;
-            if (offset < data.len) {
+            if (offset >= data.len) {
+                (r.top - 1)[0] = 0;
+            } else {
                 const off: usize = @intCast(offset);
-                const n = @min(data.len - off, 32);
-                @memcpy(word[0..n], data[off..][0..n]);
+                if (data.len - off < 32) return .slow;
+                (r.top - 1)[0] = std.mem.readInt(U, data[off..][0..32], .big);
             }
-            r.sb[r.sp - 1] = std.mem.readInt(primitives.U256, &word, .big);
-            continue :sw code[r.pc];
-        },
-        0x14 => { // EQ
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.eq)) return;
-            continue :sw code[r.pc];
-        },
-        0x15 => { // ISZERO
-            r.pc += 1;
-            if (!unop(self, &r, gas_costs.G_VERYLOW, ops.iszero)) return;
-            continue :sw code[r.pc];
-        },
-        0x16 => { // AND
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.band)) return;
-            continue :sw code[r.pc];
-        },
-        0x17 => { // OR
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.bor)) return;
-            continue :sw code[r.pc];
-        },
-        0x18 => { // XOR
-            r.pc += 1;
-            if (!binop(self, &r, gas_costs.G_VERYLOW, ops.bxor)) return;
-            continue :sw code[r.pc];
-        },
-        0x19 => { // NOT
-            r.pc += 1;
-            if (!unop(self, &r, gas_costs.G_VERYLOW, ops.not)) return;
-            continue :sw code[r.pc];
-        },
-        // SHL/SHR/SAR — fork-gated on Constantinople (EIP-145), see the note above.
-        // When the gate is closed the table holds opUnknown for them.
-        0x1B => { // SHL
-            r.pc += 1;
-            if (has_shifts) {
-                if (!binop(self, &r, gas_costs.G_VERYLOW, ops.shl)) return;
-            } else if (!coldReg(self, table, ctx, 0x1B, &r)) return;
-            continue :sw code[r.pc];
-        },
-        0x1C => { // SHR
-            r.pc += 1;
-            if (has_shifts) {
-                if (!binop(self, &r, gas_costs.G_VERYLOW, ops.shr)) return;
-            } else if (!coldReg(self, table, ctx, 0x1C, &r)) return;
-            continue :sw code[r.pc];
-        },
-        0x1D => { // SAR
-            r.pc += 1;
-            if (has_shifts) {
-                if (!viaSelf(self, &r, gas_costs.G_VERYLOW, opcodes.opSar, .{ctx})) return;
-            } else if (!coldReg(self, table, ctx, 0x1D, &r)) return;
-            continue :sw code[r.pc];
         },
         0x50 => { // POP
-            r.pc += 1;
-            if (!charge(self, &r, gas_costs.G_BASE)) return;
-            if (r.sp < 1) {
-                fail(self, &r, .stack_underflow);
-                return;
-            }
+            r.top -= 1;
             r.sp -= 1;
-            continue :sw code[r.pc];
         },
-        // MLOAD/MSTORE/MSTORE8 — Frontier, behaviour-stable, G_VERYLOW static with
-        // memory expansion billed inside the handler (through `self.gas`).
-        // MLOAD/MSTORE stay in registers when the word is already inside memory
-        // (no expansion, so no gas beyond the static G_VERYLOW). Anything else, including
-        // every error, goes through the handler unchanged.
+        // MLOAD/MSTORE stay here when the word is already inside memory (no expansion,
+        // so no gas beyond the static G_VERYLOW).
         0x51 => { // MLOAD
-            r.pc += 1;
-            if (r.sp >= 1 and r.gas >= gas_costs.G_VERYLOW and inMemory(self, r.sb[r.sp - 1])) {
-                r.gas -= gas_costs.G_VERYLOW;
-                const off: usize = @intCast(r.sb[r.sp - 1]);
-                r.sb[r.sp - 1] = std.mem.readInt(primitives.U256, self.memory.buffer.items[off..][0..32], .big);
-            } else if (!viaSelf(self, &r, gas_costs.G_VERYLOW, opcodes.opMload, .{ctx})) return;
-            continue :sw code[r.pc];
+            if (!inMemory(self, (r.top - 1)[0])) return .slow;
+            const off: usize = @intCast((r.top - 1)[0]);
+            (r.top - 1)[0] = std.mem.readInt(U, self.memory.buffer.items[off..][0..32], .big);
         },
         0x52 => { // MSTORE
-            r.pc += 1;
-            if (r.sp >= 2 and r.gas >= gas_costs.G_VERYLOW and inMemory(self, r.sb[r.sp - 1])) {
-                r.gas -= gas_costs.G_VERYLOW;
-                const off: usize = @intCast(r.sb[r.sp - 1]);
-                std.mem.writeInt(primitives.U256, self.memory.buffer.items[off..][0..32], r.sb[r.sp - 2], .big);
-                r.sp -= 2;
-            } else if (!viaSelf(self, &r, gas_costs.G_VERYLOW, opcodes.opMstore, .{ctx})) return;
-            continue :sw code[r.pc];
+            if (!inMemory(self, (r.top - 1)[0])) return .slow;
+            const off: usize = @intCast((r.top - 1)[0]);
+            std.mem.writeInt(U, self.memory.buffer.items[off..][0..32], (r.top - 2)[0], .big);
+            r.top -= 2;
+            r.sp -= 2;
         },
-        0x53 => { // MSTORE8
-            r.pc += 1;
-            if (!viaSelf(self, &r, gas_costs.G_VERYLOW, opcodes.opMstore8, .{ctx})) return;
-            continue :sw code[r.pc];
-        },
-        // JUMP lands one past the JUMPDEST and charges its gas here, so a taken
-        // jump never dispatches the JUMPDEST. Same outcome as running it: JUMPDEST
-        // costs G_JUMPDEST and does nothing else.
+        // JUMP lands one past the JUMPDEST and charges its gas here, so a taken jump
+        // never dispatches the JUMPDEST. Same outcome as running it: JUMPDEST costs
+        // G_JUMPDEST and does nothing else.
         0x56 => { // JUMP
-            r.pc += 1;
-            if (!charge(self, &r, gas_costs.G_MID)) return;
-            if (r.sp < 1) {
-                fail(self, &r, .stack_underflow);
-                return;
-            }
+            const d = validJump(fr, (r.top - 1)[0]) orelse return .slow;
+            if (r.gas < m.gas + gas_costs.G_JUMPDEST) return .slow;
+            r.gas -= m.gas + gas_costs.G_JUMPDEST;
+            r.top -= 1;
             r.sp -= 1;
-            const d = jumpTarget(self, r.sb[r.sp]) orelse {
-                fail(self, &r, .invalid_jump);
-                return;
-            };
-            r.pc = d + 1;
-            if (!charge(self, &r, gas_costs.G_JUMPDEST)) return;
-            continue :sw code[r.pc];
+            r.ip = fr.base + d + 1;
+            return .jumped;
         },
         0x57 => { // JUMPI
-            r.pc += 1;
-            if (!charge(self, &r, gas_costs.G_HIGH)) return;
-            if (r.sp < 2) {
-                fail(self, &r, .stack_underflow);
-                return;
+            if ((r.top - 2)[0] != 0) {
+                const d = validJump(fr, (r.top - 1)[0]) orelse return .slow;
+                if (r.gas < m.gas + gas_costs.G_JUMPDEST) return .slow;
+                r.gas -= m.gas + gas_costs.G_JUMPDEST;
+                r.top -= 2;
+                r.sp -= 2;
+                r.ip = fr.base + d + 1;
+                return .jumped;
             }
-            const dest = r.sb[r.sp - 1];
-            const cond = r.sb[r.sp - 2];
+            r.top -= 2;
             r.sp -= 2;
-            if (cond != 0) {
-                const d = jumpTarget(self, dest) orelse {
-                    fail(self, &r, .invalid_jump);
-                    return;
-                };
-                r.pc = d + 1;
-                if (!charge(self, &r, gas_costs.G_JUMPDEST)) return;
-            }
-            continue :sw code[r.pc];
         },
-        0x5B => { // JUMPDEST (reached by falling through, not by a jump)
-            r.pc += 1;
-            if (!charge(self, &r, gas_costs.G_JUMPDEST)) return;
-            continue :sw code[r.pc];
-        },
-        // PUSH1..PUSH32: immediates read straight from the code slice.
-        inline 0x60...0x7F => |push_op| {
-            const n = push_op - 0x60 + 1;
-            r.pc += 1;
-            if (!charge(self, &r, gas_costs.G_VERYLOW)) return;
-            if (r.sp >= stack_mod.STACK_LIMIT) {
-                fail(self, &r, .stack_overflow);
-                return;
-            }
+        0x5B => {}, // JUMPDEST (reached by falling through, not by a jump)
+        0x60...0x7F => { // PUSH1..PUSH32: immediates read straight from the code
+            const n = op - 0x60 + 1;
             var buf: [32]u8 = .{0} ** 32;
-            @memcpy(buf[32 - n ..], code[r.pc..][0..n]);
-            const U = primitives.U256;
-            r.sb[r.sp] = (@as(U, std.mem.readInt(u64, buf[0..8], .big)) << 192) |
+            @memcpy(buf[32 - n ..], r.ip[1..][0..n]);
+            push(r, (@as(U, std.mem.readInt(u64, buf[0..8], .big)) << 192) |
                 (@as(U, std.mem.readInt(u64, buf[8..16], .big)) << 128) |
                 (@as(U, std.mem.readInt(u64, buf[16..24], .big)) << 64) |
-                @as(U, std.mem.readInt(u64, buf[24..32], .big));
-            r.sp += 1;
-            r.pc += n;
-            continue :sw code[r.pc];
+                @as(U, std.mem.readInt(u64, buf[24..32], .big)));
+            r.ip += n;
         },
-        // DUP1..DUP16: comptime N folds the depth checks.
-        inline 0x80...0x8F => |dup_op| {
-            const n = dup_op - 0x80 + 1;
-            r.pc += 1;
-            if (!charge(self, &r, gas_costs.G_VERYLOW)) return;
-            if (r.sp < n) {
-                fail(self, &r, .stack_underflow);
-                return;
-            }
-            if (r.sp >= stack_mod.STACK_LIMIT) {
-                fail(self, &r, .stack_overflow);
-                return;
-            }
-            r.sb[r.sp] = r.sb[r.sp - n];
-            r.sp += 1;
-            continue :sw code[r.pc];
+        0x80...0x8F => push(r, (r.top - (op - 0x80 + 1))[0]), // DUP1..DUP16
+        0x90...0x9F => { // SWAP1..SWAP16
+            const n = op - 0x90 + 1;
+            const t = (r.top - 1)[0];
+            (r.top - 1)[0] = (r.top - 1 - n)[0];
+            (r.top - 1 - n)[0] = t;
         },
-        // SWAP1..SWAP16: comptime N folds the depth checks.
-        inline 0x90...0x9F => |swap_op| {
-            const n = swap_op - 0x90 + 1;
-            r.pc += 1;
-            if (!charge(self, &r, gas_costs.G_VERYLOW)) return;
-            if (r.sp < n + 1) {
-                fail(self, &r, .stack_underflow);
-                return;
-            }
-            const t = r.sb[r.sp - 1];
-            r.sb[r.sp - 1] = r.sb[r.sp - 1 - n];
-            r.sb[r.sp - 1 - n] = t;
-            continue :sw code[r.pc];
+        0x5A => push(r, r.gas - m.gas), // GAS: the gas left after its own charge
+        0x3D => push(r, self.return_data.data.len), // RETURNDATASIZE (gate open)
+        0x5F => push(r, 0), // PUSH0 (gate open)
+        // ADDRESS, CALLER, CALLVALUE, CALLDATASIZE, CODESIZE, PC, MSIZE
+        0x30 => push(r, host_mod.addressToU256(self.input.target)),
+        0x33 => push(r, host_mod.addressToU256(self.input.caller)),
+        0x34 => push(r, self.input.value),
+        0x36 => push(r, self.input.data.len),
+        0x38 => push(r, fr.code_len),
+        0x58 => push(r, @intFromPtr(r.ip) - @intFromPtr(fr.base)),
+        0x59 => push(r, self.memory.size()),
+        // Block and transaction context (needs a host; gated ops in the modern table).
+        0x32 => push(r, host_mod.addressToU256((fr.host orelse return .slow).origin())),
+        0x3A => push(r, (fr.host orelse return .slow).gasPrice()),
+        0x41 => push(r, host_mod.addressToU256((fr.host orelse return .slow).coinbase())),
+        0x42 => push(r, (fr.host orelse return .slow).timestamp()),
+        0x43 => push(r, (fr.host orelse return .slow).blockNumber()),
+        0x45 => push(r, (fr.host orelse return .slow).blockGasLimit()),
+        0x46 => push(r, (fr.host orelse return .slow).chainId()),
+        0x48 => push(r, (fr.host orelse return .slow).basefee()),
+        0x4A => push(r, (fr.host orelse return .slow).blobBasefee()),
+        0x49 => { // BLOBHASH
+            const h = fr.host orelse return .slow;
+            const idx = (r.top - 1)[0];
+            (r.top - 1)[0] = if (idx > std.math.maxInt(usize)) 0 else (h.blobHash(@intCast(idx)) orelse 0);
         },
-        0x5A => { // GAS: pushes the gas left after its own charge
-            r.pc += 1;
-            if (!charge(self, &r, gas_costs.G_BASE)) return;
-            if (r.sp >= stack_mod.STACK_LIMIT) {
-                fail(self, &r, .stack_overflow);
-                return;
-            }
-            r.sb[r.sp] = r.gas;
-            r.sp += 1;
-            continue :sw code[r.pc];
-        },
-        0x3D => { // RETURNDATASIZE (EIP-211, Byzantium)
-            r.pc += 1;
-            if (has_returndata) {
-                if (!pushReg(self, &r, gas_costs.G_BASE, self.return_data.data.len)) return;
-            } else if (!coldReg(self, table, ctx, 0x3D, &r)) return;
-            continue :sw code[r.pc];
-        },
-        0x5F => { // PUSH0 (EIP-3855, Shanghai)
-            r.pc += 1;
-            if (has_push0) {
-                if (!pushReg(self, &r, gas_costs.G_BASE, 0)) return;
-            } else if (!coldReg(self, table, ctx, 0x5F, &r)) return;
-            continue :sw code[r.pc];
-        },
-        // ADDRESS, CALLER, CALLVALUE, CALLDATASIZE, CODESIZE, PC, MSIZE: Frontier,
-        // G_BASE in every fork, one value pushed. One arm, not seven: each extra arm
-        // is another predecessor of the dispatch tail, and past LLVM's
-        // tail-duplication limit every inlined arm pays a jump to a shared tail.
-        0x30, 0x33, 0x34, 0x36, 0x38, 0x58, 0x59 => |op| {
-            r.pc += 1;
-            switch (op) {
-                0x38 => if (!pushReg(self, &r, gas_costs.G_BASE, code_len)) return,
-                0x58 => if (!pushReg(self, &r, gas_costs.G_BASE, r.pc - 1)) return,
-                0x30 => if (!pushReg(self, &r, gas_costs.G_BASE, host_mod.addressToU256(self.input.target))) return,
-                0x33 => if (!pushReg(self, &r, gas_costs.G_BASE, host_mod.addressToU256(self.input.caller))) return,
-                0x34 => if (!pushReg(self, &r, gas_costs.G_BASE, self.input.value)) return,
-                0x36 => if (!pushReg(self, &r, gas_costs.G_BASE, self.input.data.len)) return,
-                0x59 => if (!pushReg(self, &r, gas_costs.G_BASE, self.memory.size())) return,
-                else => unreachable,
-            }
-            continue :sw code[r.pc];
-        },
-        // Cold path: table lookup + indirect call. Naming every cold value keeps the
-        // jump table dense over the whole u8 domain.
-        0x04...0x0f, 0x1e, 0x1f, 0x20...0x2f, 0x31, 0x32, 0x37, 0x39...0x3c, 0x3e, 0x3f...0x4f, 0x54, 0x55, 0x5c...0x5e, 0xa0...0xff => |op| {
-            r.pc += 1;
-            if (!coldReg(self, table, ctx, op, &r)) return;
-            // Only the cold path can suspend the frame, so this is the one arm
-            // that has to re-check `pending`.
-            if (self.bytecode.isNotEnd() and (!check_pending or self.pending == .none))
-                continue :sw code[r.pc];
-        },
+        else => return .slow,
     }
+    r.gas -= m.gas;
+    r.ip += 1;
+    return .next;
 }
 
-/// The cold path with the register state published for the handler and read back
-/// afterwards. Returns false if the interpreter halted (on gas or in the handler).
-inline fn coldReg(
-    self: *Interpreter,
-    table: *const InstructionTable,
-    ctx: *InstructionContext,
-    op: u8,
-    r: *Regs,
-) bool {
-    const entry = table[op];
-    if (r.gas < entry.static_gas) {
-        fail(self, r, .out_of_gas);
-        return false;
-    }
-    r.gas -= entry.static_gas;
-    spill(self, r);
-    entry.func(ctx);
-    reload(self, r);
-    return self.bytecode.isNotEnd();
+/// Static cost and stack shape of an op the fast path runs: it needs `pops` items
+/// and leaves `pushes` in their place.
+const Model = struct { gas: u64, pops: usize, pushes: usize };
+
+fn model(comptime op: u8) ?Model {
+    const VL = gas_costs.G_VERYLOW;
+    const B = gas_costs.G_BASE;
+    return switch (op) {
+        0x01, 0x03, 0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C, 0x1D => .{ .gas = VL, .pops = 2, .pushes = 1 },
+        0x02 => .{ .gas = gas_costs.G_LOW, .pops = 2, .pushes = 1 },
+        0x1E => .{ .gas = gas_costs.G_LOW, .pops = 1, .pushes = 1 },
+        0x15, 0x19, 0x35, 0x51 => .{ .gas = VL, .pops = 1, .pushes = 1 },
+        0x52 => .{ .gas = VL, .pops = 2, .pushes = 0 },
+        0x50 => .{ .gas = B, .pops = 1, .pushes = 0 },
+        0x56 => .{ .gas = gas_costs.G_MID, .pops = 1, .pushes = 0 },
+        0x57 => .{ .gas = gas_costs.G_HIGH, .pops = 2, .pushes = 0 },
+        0x5B => .{ .gas = gas_costs.G_JUMPDEST, .pops = 0, .pushes = 0 },
+        0x60...0x7F => .{ .gas = VL, .pops = 0, .pushes = 1 },
+        0x80...0x8F => .{ .gas = VL, .pops = op - 0x80 + 1, .pushes = op - 0x80 + 2 },
+        0x90...0x9F => .{ .gas = VL, .pops = op - 0x90 + 2, .pushes = op - 0x90 + 2 },
+        0x30, 0x33, 0x34, 0x36, 0x38, 0x3D, 0x58, 0x59, 0x5A, 0x5F => .{ .gas = B, .pops = 0, .pushes = 1 },
+        0x32, 0x3A, 0x41, 0x42, 0x43, 0x45, 0x46, 0x48, 0x4A => .{ .gas = B, .pops = 0, .pushes = 1 },
+        0x49 => .{ .gas = VL, .pops = 1, .pushes = 1 },
+        else => null,
+    };
 }
+
+/// Ops whose fork gate the modern table assumes open.
+fn gated(op: u8) bool {
+    return switch (op) {
+        0x1B, 0x1C, 0x1D, 0x1E, 0x3D, 0x5F, 0x46, 0x48, 0x49, 0x4A => true,
+        else => false,
+    };
+}
+
+/// Hands the op at `ip` back to runDispatch.
+fn exit(fr: *const Frame, ip: [*]const u8, gas: u64, top: [*]U, sp: usize, tbl: *const anyopaque) callconv(.c) void {
+    _ = top;
+    _ = tbl;
+    spill(fr, &.{ .ip = ip, .gas = gas, .top = undefined, .sp = sp });
+}
+
+/// Ops a PUSH runs inline when they follow its immediate (the two-byte key cannot see
+/// them: its second byte is the immediate). Picked from mainnet follower counts.
+fn pushFollowers(comptime op: u8) []const u8 {
+    return switch (op) {
+        0x60 => &.{}, // PUSH1: followers too spread out to pay for the check
+        0x63 => &.{ 0x14, 0x11 }, // PUSH4: EQ, GT (selector matching)
+        0x73 => &.{0x16}, // PUSH20: AND
+        0x61 => &.{ 0x57, 0x56 }, // PUSH2: JUMPI, JUMP
+        else => &.{},
+    };
+}
+
+/// PUSHn dest; JUMP / JUMPI without putting dest on the stack. False (nothing changed)
+/// when anything is off; the caller then runs the PUSH alone.
+inline fn pushJump(comptime op: u8, comptime f: u8, fr: *const Frame, r: *Regs) bool {
+    const n = op - 0x5f;
+    if (r.sp >= stack_mod.STACK_LIMIT) return false; // the PUSH itself would overflow
+    var buf: [32]u8 = .{0} ** 32;
+    @memcpy(buf[32 - n ..], r.ip[1..][0..n]);
+    const dest = std.mem.readInt(U, &buf, .big);
+    const VL = gas_costs.G_VERYLOW;
+    if (f == 0x56) {
+        const cost = VL + gas_costs.G_MID + gas_costs.G_JUMPDEST;
+        if (r.gas < cost) return false;
+        const d = validJump(fr, dest) orelse return false;
+        r.gas -= cost;
+        r.ip = fr.base + d + 1;
+        return true;
+    }
+    if (r.sp < 1) return false;
+    if ((r.top - 1)[0] != 0) {
+        const cost = VL + gas_costs.G_HIGH + gas_costs.G_JUMPDEST;
+        if (r.gas < cost) return false;
+        const d = validJump(fr, dest) orelse return false;
+        r.gas -= cost;
+        r.ip = fr.base + d + 1;
+    } else {
+        const cost = VL + gas_costs.G_HIGH;
+        if (r.gas < cost) return false;
+        r.gas -= cost;
+        r.ip += n + 2;
+    }
+    r.top -= 1;
+    r.sp -= 1;
+    return true;
+}
+
+fn pushHandler(comptime op: u8) Handler {
+    const n = op - 0x5f;
+    return &struct {
+        fn h(fr: *const Frame, ip: [*]const u8, gas: u64, top: [*]U, sp: usize, tbl: *const anyopaque) callconv(.c) void {
+            var r = Regs{ .ip = ip, .gas = gas, .top = top, .sp = sp };
+            const b = ip[1 + n];
+            inline for (comptime pushFollowers(op)) |f| {
+                if (b == f) {
+                    if (f == 0x56 or f == 0x57) {
+                        if (pushJump(op, f, fr, &r)) return next(fr, r, tbl);
+                    } else {
+                        return @call(.always_tail, fused(op, f), .{ fr, ip, gas, top, sp, tbl });
+                    }
+                }
+            }
+            if (body(op, true, fr, &r) == .slow) return spill(fr, &r);
+            return next(fr, r, tbl);
+        }
+    }.h;
+}
+
+fn single(comptime op: u8) Handler {
+    if (op >= 0x60 and op <= 0x7F) return pushHandler(op);
+    return plain(op);
+}
+
+/// One op, no lookahead (also the fused-pair fallback, so a PUSH pair cannot loop).
+fn plain(comptime op: u8) Handler {
+    return &struct {
+        fn h(fr: *const Frame, ip: [*]const u8, gas: u64, top: [*]U, sp: usize, tbl: *const anyopaque) callconv(.c) void {
+            var r = Regs{ .ip = ip, .gas = gas, .top = top, .sp = sp };
+            if (body(op, true, fr, &r) == .slow) return spill(fr, &r);
+            return next(fr, r, tbl);
+        }
+    }.h;
+}
+
+/// `a` then `b` behind one gas check and one stack check. When the combined check
+/// fails, run `a` alone and dispatch `b` normally: exact either way.
+fn fused(comptime a: u8, comptime b: u8) Handler {
+    const ma = comptime model(a).?;
+    const mb = comptime model(b).?;
+    const gas = ma.gas + mb.gas;
+    const pa: i64 = ma.pops;
+    const ua: i64 = ma.pushes;
+    const pb: i64 = mb.pops;
+    const ub: i64 = mb.pushes;
+    // Items needed before `a` so that `a` and then `b` both find theirs.
+    const lo: usize = @intCast(@max(pa, pb + pa - ua, 0));
+    // Largest growth over the pair; each push needs room for it.
+    const grow: usize = @intCast(@max(ua - pa, ua - pa + ub - pb, 0));
+    const hi: usize = stack_mod.STACK_LIMIT - grow;
+    return &struct {
+        fn h(fr: *const Frame, ip: [*]const u8, g: u64, top: [*]U, sp: usize, tbl: *const anyopaque) callconv(.c) void {
+            if (g < gas or sp < lo or sp > hi)
+                return @call(.always_tail, plain(a), .{ fr, ip, g, top, sp, tbl });
+            var r = Regs{ .ip = ip, .gas = g, .top = top, .sp = sp };
+            switch (body(a, false, fr, &r)) {
+                .slow => return spill(fr, &r),
+                .jumped => return next(fr, r, tbl),
+                .next => {},
+            }
+            if (body(b, false, fr, &r) == .slow) return spill(fr, &r);
+            return next(fr, r, tbl);
+        }
+    }.h;
+}
+
+/// Pairs run as one handler: the most frequent adjacent pairs on mainnet and Sepolia
+/// blocks whose ops both have a `model` (no PUSH first: the second byte is its immediate).
+const fused_pairs = [_][2]u8{
+    .{ 0x50, 0x60 }, // POP PUSH1
+    .{ 0x01, 0x61 }, // ADD PUSH2
+    .{ 0x57, 0x60 }, // JUMPI PUSH1
+    .{ 0x10, 0x60 }, // LT PUSH1
+    .{ 0x5A, 0x10 }, // GAS LT
+    .{ 0x50, 0x50 }, // POP POP
+    .{ 0x15, 0x61 }, // ISZERO PUSH2
+    .{ 0x90, 0x50 }, // SWAP1 POP
+    .{ 0x52, 0x60 }, // MSTORE PUSH1
+    .{ 0x50, 0x56 }, // POP JUMP
+    .{ 0x14, 0x61 }, // EQ PUSH2
+    .{ 0x80, 0x63 }, // DUP1 PUSH4
+    .{ 0x91, 0x50 }, // SWAP2 POP
+    .{ 0x57, 0x80 }, // JUMPI DUP1
+    .{ 0x91, 0x90 }, // SWAP2 SWAP1
+    .{ 0x81, 0x52 }, // DUP2 MSTORE
+    .{ 0x01, 0x90 }, // ADD SWAP1
+    .{ 0x81, 0x10 }, // DUP2 LT
+    .{ 0x10, 0x15 }, // LT ISZERO
+    .{ 0x90, 0x61 }, // SWAP1 PUSH2
+    .{ 0x92, 0x91 }, // SWAP3 SWAP2
+    .{ 0x82, 0x01 }, // DUP3 ADD
+    .{ 0x1B, 0x03 }, // SHL SUB
+    .{ 0x90, 0x56 }, // SWAP1 JUMP
+    .{ 0x90, 0x81 }, // SWAP1 DUP2
+    .{ 0x50, 0x61 }, // POP PUSH2
+    .{ 0x81, 0x01 }, // DUP2 ADD
+    .{ 0x10, 0x61 }, // LT PUSH2
+    .{ 0x01, 0x52 }, // ADD MSTORE
+    .{ 0x81, 0x81 }, // DUP2 DUP2
+    .{ 0x92, 0x50 }, // SWAP3 POP
+    .{ 0x01, 0x51 }, // ADD MLOAD
+    .{ 0x15, 0x15 }, // ISZERO ISZERO
+    .{ 0x90, 0x91 }, // SWAP1 SWAP2
+    .{ 0x51, 0x60 }, // MLOAD PUSH1
+    .{ 0x80, 0x82 }, // DUP1 DUP3
+    .{ 0x11, 0x15 }, // GT ISZERO
+    .{ 0x16, 0x60 }, // AND PUSH1
+    .{ 0x90, 0x60 }, // SWAP1 PUSH1
+    .{ 0x82, 0x61 }, // DUP3 PUSH2
+    .{ 0x16, 0x81 }, // AND DUP2
+    .{ 0x51, 0x80 }, // MLOAD DUP1
+    .{ 0x80, 0x60 }, // DUP1 PUSH1
+    .{ 0x01, 0x60 }, // ADD PUSH1
+    .{ 0x81, 0x61 }, // DUP2 PUSH2
+    .{ 0x11, 0x61 }, // GT PUSH2
+    .{ 0x50, 0x91 }, // POP SWAP2
+    .{ 0x83, 0x01 }, // DUP4 ADD
+    .{ 0x35, 0x60 }, // CDLOAD PUSH1
+    .{ 0x16, 0x90 }, // AND SWAP1
+    .{ 0x80, 0x15 }, // DUP1 ISZERO
+    .{ 0x81, 0x90 }, // DUP2 SWAP1
+    .{ 0x51, 0x90 }, // MLOAD SWAP1
+    .{ 0x50, 0x92 }, // POP SWAP3
+    .{ 0x03, 0x81 }, // SUB DUP2
+    .{ 0x03, 0x90 }, // SUB SWAP1
+    .{ 0x93, 0x92 }, // SWAP4 SWAP3
+    .{ 0x82, 0x84 }, // DUP3 DUP5
+    .{ 0x82, 0x82 }, // DUP3 DUP3
+    .{ 0x01, 0x91 }, // ADD SWAP2
+    .{ 0x83, 0x81 }, // DUP4 DUP2
+    .{ 0x80, 0x51 }, // DUP1 MLOAD
+    .{ 0x50, 0x90 }, // POP SWAP1
+    .{ 0x82, 0x16 }, // DUP3 AND
+    .{ 0x81, 0x14 }, // DUP2 EQ
+    .{ 0x5F, 0x51 }, // PUSH0 MLOAD
+    .{ 0x82, 0x11 }, // DUP3 GT
+    .{ 0x91, 0x01 }, // SWAP2 ADD
+    .{ 0x84, 0x01 }, // DUP5 ADD
+    .{ 0x81, 0x16 }, // DUP2 AND
+    .{ 0x01, 0x35 }, // ADD CDLOAD
+    .{ 0x82, 0x81 }, // DUP3 DUP2
+    .{ 0x51, 0x61 }, // MLOAD PUSH2
+    .{ 0x50, 0x80 }, // POP DUP1
+    .{ 0x83, 0x61 }, // DUP4 PUSH2
+    .{ 0x82, 0x52 }, // DUP3 MSTORE
+    .{ 0x5F, 0x61 }, // PUSH0 PUSH2
+    .{ 0x81, 0x51 }, // DUP2 MLOAD
+    .{ 0x80, 0x83 }, // DUP1 DUP4
+    .{ 0x5F, 0x60 }, // PUSH0 PUSH1
+    .{ 0x03, 0x16 }, // SUB AND
+    .{ 0x03, 0x61 }, // SUB PUSH2
+    .{ 0x16, 0x15 }, // AND ISZERO
+    .{ 0x01, 0x01 }, // ADD ADD
+    .{ 0x80, 0x61 }, // DUP1 PUSH2
+    .{ 0x81, 0x11 }, // DUP2 GT
+    .{ 0x81, 0x60 }, // DUP2 PUSH1
+    .{ 0x16, 0x61 }, // AND PUSH2
+    .{ 0x5F, 0x81 }, // PUSH0 DUP2
+    .{ 0x36, 0x03 }, // CDSIZE SUB
+    .{ 0x57, 0x61 }, // JUMPI PUSH2
+    .{ 0x5F, 0x5F }, // PUSH0 PUSH0
+    .{ 0x52, 0x50 }, // MSTORE POP
+    .{ 0x01, 0x80 }, // ADD DUP1
+    .{ 0x84, 0x61 }, // DUP5 PUSH2
+    .{ 0x90, 0x03 }, // SWAP1 SUB
+    .{ 0x51, 0x81 }, // MLOAD DUP2
+    .{ 0x80, 0x91 }, // DUP1 SWAP2
+    .{ 0x36, 0x10 }, // CDSIZE LT
+    .{ 0x12, 0x15 }, // SLT ISZERO
+    .{ 0x01, 0x81 }, // ADD DUP2
+    .{ 0x91, 0x82 }, // SWAP2 DUP3
+    .{ 0x12, 0x61 }, // SLT PUSH2
+    .{ 0x84, 0x84 }, // DUP5 DUP5
+    .{ 0x90, 0x52 }, // SWAP1 MSTORE
+    .{ 0x85, 0x01 }, // DUP6 ADD
+    .{ 0x83, 0x03 }, // DUP4 SUB
+    .{ 0x81, 0x83 }, // DUP2 DUP4
+    .{ 0x35, 0x90 }, // CDLOAD SWAP1
+    .{ 0x80, 0x35 }, // DUP1 CDLOAD
+    .{ 0x01, 0x92 }, // ADD SWAP3
+    .{ 0x83, 0x83 }, // DUP4 DUP4
+    .{ 0x16, 0x56 }, // AND JUMP
+    .{ 0x81, 0x35 }, // DUP2 CDLOAD
+    .{ 0x02, 0x60 }, // MUL PUSH1
+    .{ 0x82, 0x60 }, // DUP3 PUSH1
+    .{ 0x03, 0x12 }, // SUB SLT
+    .{ 0x80, 0x80 }, // DUP1 DUP1
+    .{ 0x93, 0x50 }, // SWAP4 POP
+    .{ 0x90, 0x92 }, // SWAP1 SWAP3
+    .{ 0x57, 0x50 }, // JUMPI POP
+    .{ 0x5F, 0x52 }, // PUSH0 MSTORE
+    .{ 0x1C, 0x80 }, // SHR DUP1
+    .{ 0x50, 0x81 }, // POP DUP2
+    .{ 0x16, 0x73 }, // AND PUSH20
+    .{ 0x92, 0x90 }, // SWAP3 SWAP1
+    .{ 0x03, 0x60 }, // SUB PUSH1
+    .{ 0x03, 0x01 }, // SUB ADD
+    .{ 0x50, 0x5B }, // POP JUMPDEST
+    .{ 0x15, 0x80 }, // ISZERO DUP1
+    .{ 0x83, 0x82 }, // DUP4 DUP3
+    .{ 0x51, 0x91 }, // MLOAD SWAP2
+    .{ 0x90, 0x5F }, // SWAP1 PUSH0
+    .{ 0x83, 0x60 }, // DUP4 PUSH1
+    .{ 0x85, 0x61 }, // DUP6 PUSH2
+    .{ 0x52, 0x61 }, // MSTORE PUSH2
+    .{ 0x02, 0x01 }, // MUL ADD
+    .{ 0x86, 0x01 }, // DUP7 ADD
+    .{ 0x03, 0x82 }, // SUB DUP3
+    .{ 0x90, 0x63 }, // SWAP1 PUSH4
+    .{ 0x82, 0x03 }, // DUP3 SUB
+    .{ 0x82, 0x90 }, // DUP3 SWAP1
+    .{ 0x84, 0x60 }, // DUP5 PUSH1
+    .{ 0x52, 0x82 }, // MSTORE DUP3
+    .{ 0x51, 0x83 }, // MLOAD DUP4
+    .{ 0x82, 0x10 }, // DUP3 LT
+    .{ 0x84, 0x03 }, // DUP5 SUB
+    .{ 0x85, 0x85 }, // DUP6 DUP6
+    .{ 0x57, 0x56 }, // JUMPI JUMP
+    .{ 0x81, 0x15 }, // DUP2 ISZERO
+    .{ 0x91, 0x03 }, // SWAP2 SUB
+    .{ 0x16, 0x82 }, // AND DUP3
+    .{ 0x52, 0x90 }, // MSTORE SWAP1
+    .{ 0x81, 0x12 }, // DUP2 SLT
+    .{ 0x14, 0x15 }, // EQ ISZERO
+    .{ 0x36, 0x60 }, // CDSIZE PUSH1
+    .{ 0x57, 0x81 }, // JUMPI DUP2
+    .{ 0x3D, 0x60 }, // RDSIZE PUSH1
+    .{ 0x5F, 0x83 }, // PUSH0 DUP4
+    .{ 0x85, 0x81 }, // DUP6 DUP2
+    .{ 0x83, 0x16 }, // DUP4 AND
+    .{ 0x90, 0x83 }, // SWAP1 DUP4
+    .{ 0x17, 0x61 }, // OR PUSH2
+    .{ 0x90, 0x82 }, // SWAP1 DUP3
+    .{ 0x02, 0x81 }, // MUL DUP2
+    .{ 0x57, 0x5F }, // JUMPI PUSH0
+    .{ 0x5B, 0x50 }, // JUMPDEST POP
+    .{ 0x91, 0x60 }, // SWAP2 PUSH1
+    .{ 0x01, 0x16 }, // ADD AND
+    .{ 0x5F, 0x73 }, // PUSH0 PUSH20
+    .{ 0x84, 0x81 }, // DUP5 DUP2
+    .{ 0x52, 0x56 }, // MSTORE JUMP
+    .{ 0x82, 0x35 }, // DUP3 CDLOAD
+    .{ 0x80, 0x84 }, // DUP1 DUP5
+    .{ 0x19, 0x16 }, // NOT AND
+    .{ 0x57, 0x5B }, // JUMPI JUMPDEST
+    .{ 0x5F, 0x82 }, // PUSH0 DUP3
+    .{ 0x80, 0x36 }, // DUP1 CDSIZE
+    .{ 0x35, 0x61 }, // CDLOAD PUSH2
+    .{ 0x33, 0x73 }, // CALLER PUSH20
+    .{ 0x91, 0x61 }, // SWAP2 PUSH2
+    .{ 0x84, 0x16 }, // DUP5 AND
+    .{ 0x34, 0x80 }, // CALLVALUE DUP1
+    .{ 0x82, 0x02 }, // DUP3 MUL
+    .{ 0x5F, 0x80 }, // PUSH0 DUP1
+    .{ 0x01, 0x82 }, // ADD DUP3
+    .{ 0x5B, 0x61 }, // JUMPDEST PUSH2
+    .{ 0x52, 0x80 }, // MSTORE DUP1
+    .{ 0x01, 0x93 }, // ADD SWAP4
+    .{ 0x16, 0x80 }, // AND DUP1
+    .{ 0x15, 0x82 }, // ISZERO DUP3
+    .{ 0x16, 0x91 }, // AND SWAP2
+    .{ 0x86, 0x61 }, // DUP7 PUSH2
+    .{ 0x50, 0x82 }, // POP DUP3
+    .{ 0x1C, 0x60 }, // SHR PUSH1
+    .{ 0x84, 0x52 }, // DUP5 MSTORE
+    .{ 0x81, 0x85 }, // DUP2 DUP6
+    .{ 0x83, 0x52 }, // DUP4 MSTORE
+    .{ 0x03, 0x83 }, // SUB DUP4
+    .{ 0x16, 0x14 }, // AND EQ
+    .{ 0x90, 0x80 }, // SWAP1 DUP1
+    .{ 0x03, 0x80 }, // SUB DUP1
+    .{ 0x85, 0x60 }, // DUP6 PUSH1
+    .{ 0x95, 0x50 }, // SWAP6 POP
+    .{ 0x19, 0x82 }, // NOT DUP3
+    .{ 0x01, 0x83 }, // ADD DUP4
+    .{ 0x90, 0x93 }, // SWAP1 SWAP4
+    .{ 0x81, 0x84 }, // DUP2 DUP5
+    .{ 0x35, 0x73 }, // CDLOAD PUSH20
+    .{ 0x84, 0x82 }, // DUP5 DUP3
+    .{ 0x83, 0x85 }, // DUP4 DUP6
+    .{ 0x11, 0x17 }, // GT OR
+    .{ 0x51, 0x82 }, // MLOAD DUP3
+    .{ 0x01, 0x84 }, // ADD DUP5
+    .{ 0x14, 0x17 }, // EQ OR
+    .{ 0x81, 0x03 }, // DUP2 SUB
+    .{ 0x91, 0x16 }, // SWAP2 AND
+    .{ 0x91, 0x52 }, // SWAP2 MSTORE
+    .{ 0x94, 0x50 }, // SWAP5 POP
+    .{ 0x87, 0x61 }, // DUP8 PUSH2
+    .{ 0x84, 0x14 }, // DUP5 EQ
+    .{ 0x16, 0x92 }, // AND SWAP3
+    .{ 0x83, 0x11 }, // DUP4 GT
+    .{ 0x82, 0x15 }, // DUP3 ISZERO
+    .{ 0x16, 0x7F }, // AND PUSH32
+    .{ 0x16, 0x84 }, // AND DUP5
+    .{ 0x5B, 0x60 }, // JUMPDEST PUSH1
+    .{ 0x86, 0x86 }, // DUP7 DUP7
+    .{ 0x93, 0x90 }, // SWAP4 SWAP1
+    .{ 0x83, 0x36 }, // DUP4 CDSIZE
+    .{ 0x1B, 0x81 }, // SHL DUP2
+    .{ 0x85, 0x16 }, // DUP6 AND
+    .{ 0x84, 0x83 }, // DUP5 DUP4
+    .{ 0x94, 0x93 }, // SWAP5 SWAP4
+    .{ 0x35, 0x91 }, // CDLOAD SWAP2
+    .{ 0x50, 0x5F }, // POP PUSH0
+    .{ 0x52, 0x91 }, // MSTORE SWAP2
+    .{ 0x92, 0x01 }, // SWAP3 ADD
+    .{ 0x51, 0x16 }, // MLOAD AND
+    .{ 0x80, 0x85 }, // DUP1 DUP6
+    .{ 0x02, 0x90 }, // MUL SWAP1
+    .{ 0x91, 0x81 }, // SWAP2 DUP2
+    .{ 0x19, 0x83 }, // NOT DUP4
+    .{ 0x92, 0x83 }, // SWAP3 DUP4
+    .{ 0x80, 0x5F }, // DUP1 PUSH0
+    .{ 0x87, 0x01 }, // DUP8 ADD
+    .{ 0x90, 0x51 }, // SWAP1 MLOAD
+    .{ 0x90, 0x94 }, // SWAP1 SWAP5
+    .{ 0x52, 0x34 }, // MSTORE CALLVALUE
+    .{ 0x50, 0x03 }, // POP SUB
+    .{ 0x82, 0x51 }, // DUP3 MLOAD
+    .{ 0x01, 0x12 }, // ADD SLT
+    .{ 0x92, 0x60 }, // SWAP3 PUSH1
+    .{ 0x14, 0x90 }, // EQ SWAP1
+    .{ 0x17, 0x15 }, // OR ISZERO
+    .{ 0x57, 0x90 }, // JUMPI SWAP1
+};
+
+fn makeTable(comptime modern: bool) [65536]Handler {
+    @setEvalBranchQuota(10_000_000);
+    var singles: [256]Handler = undefined;
+    for (0..256) |i| {
+        const op: u8 = @intCast(i);
+        singles[i] = if (model(op) == null or (!modern and gated(op))) &exit else if (!modern) plain(op) else single(op);
+    }
+    var t: [65536]Handler = undefined;
+    for (0..65536) |k| t[k] = singles[k & 0xFF];
+    for (fused_pairs) |p| {
+        if (!modern and (gated(p[0]) or gated(p[1]))) continue;
+        t[@as(usize, p[0]) | @as(usize, p[1]) << 8] = fused(p[0], p[1]);
+    }
+    return t;
+}
+
+const modern_table = makeTable(true);
+const legacy_table = makeTable(false);
 
 /// Calculate number of words from bytes
 pub fn numWords(bytes: usize) usize {
