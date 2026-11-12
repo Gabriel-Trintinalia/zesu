@@ -24,13 +24,29 @@ const primitives = @import("primitives");
 // free. A bucket collision recomputes and overwrites, so the result is always
 // correct. Because keccak256 is pure, the cache is sound to share across calls
 // regardless of target — and crucially it runs on native too, so the state-test /
-// spec-test suites exercise the exact code path the zkVM guest uses (zesu's
-// execution model is single-threaded, so the plain globals carry no race risk).
+// spec-test suites exercise the exact code path the zkVM guest uses.
+// On hosted targets each thread has its own memo, so executions on different threads
+// never race on it (~1 MiB per thread that hashes); a freestanding guest is single-threaded
+// and keeps plain globals (no thread-local storage there).
 // kmemo_len 0 = empty slot.
 const KMEMO_LEN = 1 << 14; // 16384 buckets
-var kmemo_len = [_]u8{0} ** KMEMO_LEN;
-var kmemo_key: [KMEMO_LEN][32]u8 = undefined;
-var kmemo_val: [KMEMO_LEN][32]u8 = undefined;
+const kmemo_per_thread = @import("builtin").os.tag != .freestanding;
+var kmemo_len_global = [_]u8{0} ** KMEMO_LEN;
+var kmemo_key_global: [KMEMO_LEN][32]u8 = undefined;
+var kmemo_val_global: [KMEMO_LEN][32]u8 = undefined;
+threadlocal var kmemo_len_thread = [_]u8{0} ** KMEMO_LEN;
+threadlocal var kmemo_key_thread: [KMEMO_LEN][32]u8 = undefined;
+threadlocal var kmemo_val_thread: [KMEMO_LEN][32]u8 = undefined;
+
+inline fn kmemoLen() *[KMEMO_LEN]u8 {
+    return if (kmemo_per_thread) &kmemo_len_thread else &kmemo_len_global;
+}
+inline fn kmemoKey() *[KMEMO_LEN][32]u8 {
+    return if (kmemo_per_thread) &kmemo_key_thread else &kmemo_key_global;
+}
+inline fn kmemoVal() *[KMEMO_LEN][32]u8 {
+    return if (kmemo_per_thread) &kmemo_val_thread else &kmemo_val_global;
+}
 
 // ── Type aliases ──────────────────────────────────────────────────────────────
 
@@ -101,6 +117,9 @@ pub inline fn keccak256(data: []const u8, output: *Hash32) void {
     }
     if (data.len == 20 or data.len == 32) {
         const idx = kmemoIndex(data);
+        const kmemo_len = kmemoLen();
+        const kmemo_key = kmemoKey();
+        const kmemo_val = kmemoVal();
         if (kmemo_len[idx] == data.len and std.mem.eql(u8, kmemo_key[idx][0..data.len], data)) {
             output.* = kmemo_val[idx];
             return;
@@ -234,4 +253,23 @@ pub inline fn secp256r1_verify(
     verified: *bool,
 ) void {
     impl.secp256r1_verify(msg, sig, pubkey, verified);
+}
+
+test "each thread has its own keccak256 memo" {
+    const key: [32]u8 = @splat(0x5a);
+    var hash: Hash32 = undefined;
+    keccak256(&key, &hash);
+    const idx = kmemoIndex(&key);
+    try std.testing.expectEqual(@as(u8, 32), kmemoLen()[idx]);
+
+    const Worker = struct {
+        fn run(i: usize, held: *bool) void {
+            // The key this thread never hashed is not in its memo.
+            held.* = kmemoLen()[i] != 0;
+        }
+    };
+    var held = true;
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ idx, &held });
+    t.join();
+    try std.testing.expect(!held);
 }

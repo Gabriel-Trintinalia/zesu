@@ -18,17 +18,25 @@ const builtin = @import("builtin");
 ///
 /// Lifetime: the backing allocator state (FixedBufferAllocator/arena/…) must outlive every
 ///   `get()` call — in practice for the whole program/guest lifetime.
-/// Concurrency: not thread-safe. Call `set()` once at startup before spawning any threads.
-///   zkVM guests are single-threaded, so this is a non-issue there.
-var current: ?std.mem.Allocator = null;
+/// Concurrency: on hosted targets the allocator is per thread: `set()` applies to the calling
+///   thread, so executions on different threads can each use their own allocator. A thread that
+///   never calls `set()` gets the default. Freestanding targets (zkVM guests: single-threaded, no
+///   thread-local storage) keep one global.
+const per_thread = builtin.os.tag != .freestanding;
+var current_global: ?std.mem.Allocator = null;
+threadlocal var current_thread: ?std.mem.Allocator = null;
 
-/// Install the allocator returned by subsequent `get()` calls.
+inline fn current() *?std.mem.Allocator {
+    return if (per_thread) &current_thread else &current_global;
+}
+
+/// Install the allocator returned by subsequent `get()` calls (on this thread, when hosted).
 pub fn set(allocator: std.mem.Allocator) void {
-    current = allocator;
+    current().* = allocator;
 }
 
 pub fn get() std.mem.Allocator {
-    return current orelse defaultAllocator();
+    return current().* orelse defaultAllocator();
 }
 
 fn defaultAllocator() std.mem.Allocator {
@@ -39,4 +47,28 @@ fn defaultAllocator() std.mem.Allocator {
     } else {
         return std.heap.c_allocator;
     }
+}
+
+test "set applies to the calling thread" {
+    var buf_a: [64]u8 = undefined;
+    var fba_a = std.heap.FixedBufferAllocator.init(&buf_a);
+    set(fba_a.allocator());
+    defer current().* = null;
+
+    const Worker = struct {
+        fn run(main_ptr: *anyopaque, saw_own: *bool) void {
+            // A new thread starts with the default, not the allocator another thread set.
+            saw_own.* = get().ptr != main_ptr;
+            var buf_b: [64]u8 = undefined;
+            var fba_b = std.heap.FixedBufferAllocator.init(&buf_b);
+            set(fba_b.allocator());
+            saw_own.* = saw_own.* and get().ptr == @as(*anyopaque, @ptrCast(&fba_b));
+        }
+    };
+    var saw_own = false;
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ @as(*anyopaque, @ptrCast(&fba_a)), &saw_own });
+    t.join();
+    try std.testing.expect(saw_own);
+    // The worker's set() did not change this thread's allocator.
+    try std.testing.expect(get().ptr == @as(*anyopaque, @ptrCast(&fba_a)));
 }
